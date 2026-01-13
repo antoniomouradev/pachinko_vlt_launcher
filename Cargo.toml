@@ -1,0 +1,54 @@
+[package]
+name = "pachinko_vlt_launcher"
+version = "0.1.0"
+edition = "2021"
+authors = ["Pachinko Team"]
+description = "Launcher VLT para registro e autenticação de máquinas"
+license = "PROPRIETARY"
+
+[dependencies]
+# HTTP Client
+reqwest = { version = "0.11", features = ["json"] }
+tokio = { version = "1.0", features = ["full"] }
+
+# Serialização JSON
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error Handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# CLI
+clap = { version = "4.0", features = ["derive"] }
+
+# Configuração e Paths
+dirs = "5.0"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Data/Hora
+chrono = { version = "0.4", features = ["serde"] }
+
+# Hostname
+hostname = "0.4"
+
+# Criptografia
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+base64 = "0.21"
+
+# Linux-specific
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+mockito = "1.0"
+tokio-test = "0.4"
+
+[[bin]]
+name = "pachinko_vlt_launcher"
+path = "src/main.rs"
