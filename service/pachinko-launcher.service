@@ -1,0 +1,17 @@
+[Unit]
+Description=Pachinko VLT Launcher - Registro e Autenticação de Máquinas
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/pachinko_vlt_launcher
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment="RGS_URL=http://localhost:43310"
+Environment="RUST_LOG=info"
+
+[Install]
+WantedBy=multi-user.target

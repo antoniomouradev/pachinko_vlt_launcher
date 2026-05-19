@@ -22,6 +22,9 @@ thiserror = "1.0"
 # CLI
 clap = { version = "4.0", features = ["derive"] }
 
+# Setup interativo
+dialoguer = "0.11"
+
 # Configuração e Paths
 dirs = "5.0"
 
@@ -35,11 +38,8 @@ chrono = { version = "0.4", features = ["serde"] }
 # Hostname
 hostname = "0.4"
 
-# Criptografia
-aes-gcm = "0.10"
-hkdf = "0.12"
+# Hardware fingerprint
 sha2 = "0.10"
-base64 = "0.21"
 
 # Linux-specific
 [target.'cfg(unix)'.dependencies]

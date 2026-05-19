@@ -1,66 +1,111 @@
-use crate::hardware::HardwareInfo;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize)]
-struct RegisterRequest {
-    hardware_info: HardwareInfo,
+#[derive(Debug, Deserialize)]
+pub struct PairResponse {
+    pub status: String,
+    pub machine_code: String,
+    pub token: String,
+    #[serde(default)]
+    pub rgs_url: String,
+    #[serde(default)]
+    pub rgs_port: serde_json::Value,
+    #[serde(default)]
+    pub coin_list: Vec<u32>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RegisterResponse {
+pub struct TokenResponse {
     pub status: String,
-    pub machine_id: u32,
-    pub hardware_fingerprint: String,
+    pub token: String,
     #[serde(default)]
-    pub registration_pin: Option<String>,
-    pub requires_approval: bool,
+    pub rgs_url: String,
     #[serde(default)]
-    pub access_token: Option<String>,
+    pub rgs_port: serde_json::Value,
     #[serde(default)]
-    pub signing_secret: Option<String>,
+    pub coin_list: Vec<u32>,
 }
 
-pub async fn register_machine(
-    rgs_url: &str,
-    hardware_info: &HardwareInfo,
-) -> Result<RegisterResponse> {
-    let client = reqwest::Client::builder()
+#[derive(Debug, Serialize)]
+struct PairRequest<'a> {
+    pairing_code: &'a str,
+    hardware_fingerprint: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct LauncherRequest<'a> {
+    machine_code: &'a str,
+    hardware_fingerprint: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct HeartbeatRequest<'a> {
+    machine_code: &'a str,
+}
+
+fn build_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .context("Falha ao criar cliente HTTP")?;
+        .context("Falha ao criar cliente HTTP")
+}
 
-    let url = format!("{}/api/vlt/register_machine", rgs_url);
+pub async fn pair_machine(cs_url: &str, pairing_code: &str, fingerprint: &str) -> Result<PairResponse> {
+    let client = build_client()?;
+    let url = format!("{}/machine/pair", cs_url);
 
-    let request = RegisterRequest {
-        hardware_info: hardware_info.clone(),
-    };
-
-    let response = client
+    let resp = client
         .post(&url)
-        .json(&request)
+        .json(&PairRequest { pairing_code, hardware_fingerprint: fingerprint })
         .send()
         .await
-        .with_context(|| {
-            format!(
-                "Falha ao conectar ao servidor RGS em {}. Verifique se:\n  - O servidor RGS está rodando\n  - A URL está correta (use RGS_URL=http://host:port)\n  - A porta está acessível",
-                url
-            )
-        })?;
+        .with_context(|| format!("Falha ao conectar ao CS em {}", url))?;
 
-    if response.status().is_success() {
-        let result: RegisterResponse = response
-            .json()
-            .await
-            .context("Falha ao decodificar resposta JSON")?;
-        Ok(result)
+    let status = resp.status();
+    if status.is_success() {
+        resp.json::<PairResponse>().await.context("Falha ao decodificar resposta de pair")
     } else {
-        let status = response.status();
-        let error_text = response.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "Erro ao registrar máquina: HTTP {} - {}",
-            status,
-            error_text
-        )
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("pair_machine HTTP {}: {}", status, body)
+    }
+}
+
+pub async fn get_token(cs_url: &str, machine_code: &str, fingerprint: &str) -> Result<TokenResponse> {
+    let client = build_client()?;
+    let url = format!("{}/launcher", cs_url);
+
+    let resp = client
+        .post(&url)
+        .json(&LauncherRequest { machine_code, hardware_fingerprint: fingerprint })
+        .send()
+        .await
+        .with_context(|| format!("Falha ao conectar ao CS em {}", url))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        resp.json::<TokenResponse>().await.context("Falha ao decodificar resposta de token")
+    } else {
+        let code = status.as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("get_token HTTP {}: {}", code, body)
+    }
+}
+
+pub async fn send_heartbeat(cs_url: &str, machine_code: &str) -> Result<()> {
+    let client = build_client()?;
+    let url = format!("{}/machine/heartbeat", cs_url);
+
+    let resp = client
+        .post(&url)
+        .json(&HeartbeatRequest { machine_code })
+        .send()
+        .await
+        .with_context(|| format!("Falha ao enviar heartbeat para {}", url))?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        let code = resp.status().as_u16();
+        anyhow::bail!("heartbeat HTTP {}", code)
     }
 }

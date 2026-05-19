@@ -23,7 +23,7 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-Environment="RGS_URL=http://localhost:43310"
+Environment="CS_URL=http://localhost:8888"
 Environment="RUST_LOG=info"
 
 [Install]
