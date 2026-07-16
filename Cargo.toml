@@ -41,6 +41,13 @@ hostname = "0.4"
 # Hardware fingerprint
 sha2 = "0.10"
 
+# TUI
+ratatui = "0.28"
+crossterm = "0.28"
+
+# Áudio (listar saídas + tocar tom de teste)
+cpal = "0.15"
+
 # Linux-specific
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use crossterm::event::KeyCode;
 use log::{info, warn, error};
 use std::path::PathBuf;
 use std::process::Command;
@@ -12,6 +13,7 @@ mod config;
 mod service;
 mod error;
 mod setup;
+mod tui;
 
 use config::{LauncherConfig, LauncherSettings, load_config, save_config, delete_config, get_config_path, get_pairing_code_path, get_settings_path, load_settings};
 
@@ -128,7 +130,22 @@ async fn run() -> Result<()> {
                 }
             }
             None => {
-                wait_for_pairing(&cs_url, &fingerprint, &config_path, &settings).await?;
+                // Máquina crua (sem config ainda) — mostra o menu inicial em vez de
+                // ir direto pro pareamento. "Configurar Máquina" cai no fluxo atual
+                // de pareamento; device flow de verdade substitui isso depois.
+                match tui::run_menu()? {
+                    Some(tui::MenuChoice::ConfigureMachine) => {
+                        wait_for_pairing(&cs_url, &fingerprint, &config_path, &settings).await?;
+                    }
+                    Some(tui::MenuChoice::TestMachine) => {
+                        run_test_menu_loop().await?;
+                    }
+                    Some(tui::MenuChoice::Shutdown) => {
+                        info!("Desligado pelo menu.");
+                        return Ok(());
+                    }
+                    None => {}
+                }
             }
         }
     }
@@ -155,6 +172,113 @@ async fn try_get_token_and_run(
 
     let exit_status = spawn_game_and_wait(&token_resp.token, settings)?;
     info!("Jogo encerrado (status: {}). Reiniciando...", exit_status);
+
+    Ok(())
+}
+
+/// Fica no submenu "Testar Máquina" até o usuário apertar Esc/q.
+async fn run_test_menu_loop() -> Result<()> {
+    loop {
+        match tui::run_test_menu()? {
+            Some(tui::TestChoice::Connection) => {
+                run_connection_test_loop().await?;
+            }
+            Some(tui::TestChoice::Audio) => {
+                run_audio_test()?;
+            }
+            Some(tui::TestChoice::Video) => {
+                let displays = hardware::video::get_displays();
+                tui::run_video_test(&displays, Duration::from_millis(900))?;
+            }
+            Some(tui::TestChoice::Inputs) => run_buttonhub_test("Testar Inputs")?,
+            None => return Ok(()),
+        }
+    }
+}
+
+/// Fica pingando (checagem de internet, não é ICMP) em loop até Esc/q.
+/// `check_connection` já tem timeout de 5s — enquanto uma tentativa está
+/// pendurada (rede fora do ar), a tecla de saída só é lida depois que essa
+/// tentativa retorna, ou seja, sair pode demorar até ~5s nesse cenário.
+async fn run_connection_test_loop() -> Result<()> {
+    let mut screen = tui::enter_screen()?;
+    let mut history: Vec<String> = Vec::new();
+
+    let result: Result<()> = loop {
+        let line = match api::check_connection().await {
+            Ok(elapsed) => format!(
+                "[{}] OK — {}ms",
+                chrono::Local::now().format("%H:%M:%S"),
+                elapsed.as_millis()
+            ),
+            Err(e) => format!("[{}] FALHOU — {}", chrono::Local::now().format("%H:%M:%S"), e),
+        };
+        history.push(line);
+        if history.len() > 20 {
+            history.remove(0);
+        }
+
+        let mut lines = vec!["Ping contínuo — Esc/q para sair".to_string(), String::new()];
+        lines.extend(history.iter().cloned());
+        if let Err(e) = tui::draw_lines(&mut screen, "Conexão", &lines) {
+            break Err(e);
+        }
+
+        match tui::poll_key(Duration::from_secs(1)) {
+            Ok(Some(KeyCode::Esc)) | Ok(Some(KeyCode::Char('q'))) => break Ok(()),
+            Ok(_) => {}
+            Err(e) => break Err(e),
+        }
+    };
+
+    tui::leave_screen(screen)?;
+    result
+}
+
+/// Conecta no `buttonhub` (teclas/chaves/noteiro, tudo pelo mesmo TCP — ver
+/// interfaces/INTERFACE.md) e mostra cru cada evento que chegar.
+fn run_buttonhub_test(title: &str) -> Result<()> {
+    match hardware::buttonhub::connect(hardware::buttonhub::DEFAULT_PORT) {
+        Ok(conn) => {
+            let result = tui::run_event_stream(title, &conn.events);
+            conn.close();
+            result
+        }
+        Err(e) => tui::show_placeholder(
+            title,
+            &format!(
+                "Falha ao conectar no buttonhub (porta {}): {}",
+                hardware::buttonhub::DEFAULT_PORT,
+                e
+            ),
+        ),
+    }
+}
+
+/// Lista as saídas de áudio, deixa escolher uma e toca um tom de 440Hz por
+/// 2s nela — pra confirmar que o som sai por aquela saída física.
+fn run_audio_test() -> Result<()> {
+    let devices = match hardware::audio::list_output_devices() {
+        Ok(d) if !d.is_empty() => d,
+        Ok(_) => {
+            tui::show_placeholder("Som", "Nenhuma saída de áudio encontrada")?;
+            return Ok(());
+        }
+        Err(e) => {
+            tui::show_placeholder("Som", &format!("Erro ao listar saídas: {}", e))?;
+            return Ok(());
+        }
+    };
+
+    let items: Vec<&str> = devices.iter().map(String::as_str).collect();
+    if let Some(idx) = tui::select("Som — escolha a saída", &items)? {
+        let device_name = &devices[idx];
+        let message = match hardware::audio::play_test_tone(device_name, Duration::from_secs(2)) {
+            Ok(()) => format!("Tom de 440Hz tocado em \"{}\". Ouviu?", device_name),
+            Err(e) => format!("Falha ao tocar tom em \"{}\": {}", device_name, e),
+        };
+        tui::show_placeholder("Som", &message)?;
+    }
 
     Ok(())
 }

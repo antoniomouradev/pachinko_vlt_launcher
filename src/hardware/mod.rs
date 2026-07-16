@@ -2,6 +2,9 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod audio;
+pub mod video;
+pub mod buttonhub;
 
 use serde::Serialize;
 use sha2::{Sha256, Digest};

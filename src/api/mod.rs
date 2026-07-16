@@ -91,6 +91,29 @@ pub async fn get_token(cs_url: &str, machine_code: &str, fingerprint: &str) -> R
     }
 }
 
+/// Endpoint público só pra checagem de conectividade (não é o CS) — mesma
+/// ideia do "captive portal check" que Android/ChromeOS usam.
+const INTERNET_CHECK_URL: &str = "https://1.1.1.1";
+
+/// Testa se a máquina tem internet, sem depender do CS estar no ar — é o que
+/// o técnico em campo quer saber (rede física/wifi funcionando), não se o
+/// backend específico responde.
+pub async fn check_connection() -> Result<std::time::Duration> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("Falha ao criar cliente HTTP")?;
+
+    let start = std::time::Instant::now();
+    client
+        .get(INTERNET_CHECK_URL)
+        .send()
+        .await
+        .context("Falha ao conectar à internet")?;
+
+    Ok(start.elapsed())
+}
+
 pub async fn send_heartbeat(cs_url: &str, machine_code: &str) -> Result<()> {
     let client = build_client()?;
     let url = format!("{}/machine/heartbeat", cs_url);
