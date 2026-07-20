@@ -2,6 +2,12 @@ use super::HardwareInfo;
 use anyhow::{Context, Result};
 use std::process::Command;
 
+/// macOS é só o alvo de desenvolvimento (não existe `dmidecode` aqui) — o
+/// alvo real é Linux (ver `linux.rs`). Aproxima com o que o macOS oferece:
+/// `ioreg`/`system_profiler` já dão UUID e serial de hardware reais nesse
+/// SO, só não tem equivalente direto de "CPU ID" fácil, então reusa a
+/// string do processador como placeholder (suficiente pra dev, não é o
+/// requisito de produção).
 pub fn collect() -> Result<HardwareInfo> {
     let hostname = hostname::get()
         .context("Falha ao obter hostname")?
@@ -11,23 +17,46 @@ pub fn collect() -> Result<HardwareInfo> {
     let mac = get_mac_address()
         .context("Falha ao obter MAC address")?;
 
-    let uuid = get_machine_uuid()
+    let bios_uuid = get_machine_uuid()
         .context("Falha ao obter Machine UUID")?;
 
-    let disk_serials = get_disk_serials()
-        .unwrap_or_else(|_| vec![]);
+    let baseboard_serial = get_hardware_serial()
+        .unwrap_or_else(|_| "unknown-dev".to_string());
 
     let processor = get_processor()
         .unwrap_or_else(|_| "Unknown".to_string());
 
+    let disk_serials = get_disk_serials()
+        .unwrap_or_else(|_| vec![]);
+
     Ok(HardwareInfo {
         mac_address: mac,
-        uuid,
+        bios_uuid,
+        baseboard_serial,
+        cpu_id: processor.clone(),
         disk_serials,
         processor,
         hostname,
         serial_number: None,
     })
+}
+
+fn get_hardware_serial() -> Result<String> {
+    let output = Command::new("system_profiler")
+        .args(&["SPHardwareDataType"])
+        .output()
+        .context("Falha ao executar system_profiler")?;
+
+    let output_str = String::from_utf8(output.stdout)
+        .context("Falha ao decodificar saída")?;
+
+    for line in output_str.lines() {
+        if let Some(serial) = line.trim().strip_prefix("Serial Number (system): ") {
+            return Ok(serial.trim().to_string());
+        }
+    }
+
+    anyhow::bail!("Serial Number não encontrado na saída do system_profiler")
 }
 
 fn get_machine_uuid() -> Result<String> {

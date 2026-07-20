@@ -18,7 +18,10 @@ mod tui;
 use config::{LauncherConfig, LauncherSettings, load_config, save_config, delete_config, get_config_path, get_pairing_code_path, get_settings_path, load_settings};
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+#[allow(dead_code)] // usado só no fluxo antigo (wait_for_pairing), ver comentário lá
 const PAIRING_POLL_INTERVAL_SECS: u64 = 10;
+const DEVICE_FLOW_POLL_SECS: u64 = 5;
+const DEVICE_FLOW_RETRY_SECS: u64 = 10;
 
 #[derive(Parser)]
 #[command(name = "pachinko_vlt_launcher")]
@@ -119,9 +122,9 @@ async fn run() -> Result<()> {
                         info!("Jogo encerrado. Reiniciando...");
                     }
                     Err(e) if e.to_string().contains("401") || e.to_string().contains("403") => {
-                        warn!("Credenciais inválidas ({}). Limpando config e aguardando novo pareamento.", e);
+                        warn!("Credenciais inválidas ({}). Limpando config e reiniciando device flow.", e);
                         delete_config(&config_path);
-                        wait_for_pairing(&cs_url, &fingerprint, &config_path, &settings).await?;
+                        run_device_flow(&cs_url, &fingerprint, &config_path, &settings).await?;
                     }
                     Err(e) => {
                         error!("Erro ao obter token: {}. Tentando novamente em {}s...", e, HEARTBEAT_INTERVAL_SECS);
@@ -131,11 +134,11 @@ async fn run() -> Result<()> {
             }
             None => {
                 // Máquina crua (sem config ainda) — mostra o menu inicial em vez de
-                // ir direto pro pareamento. "Configurar Máquina" cai no fluxo atual
-                // de pareamento; device flow de verdade substitui isso depois.
+                // ir direto pro registro. "Configurar Máquina" usa o device flow
+                // (autorregistro + código no backoffice), não o pareamento OTP antigo.
                 match tui::run_menu()? {
                     Some(tui::MenuChoice::ConfigureMachine) => {
-                        wait_for_pairing(&cs_url, &fingerprint, &config_path, &settings).await?;
+                        run_device_flow(&cs_url, &fingerprint, &config_path, &settings).await?;
                     }
                     Some(tui::MenuChoice::TestMachine) => {
                         run_test_menu_loop().await?;
@@ -218,14 +221,14 @@ async fn run_connection_test_loop() -> Result<()> {
             history.remove(0);
         }
 
-        let mut lines = vec!["Ping contínuo — Esc/q para sair".to_string(), String::new()];
+        let mut lines = vec!["Ping contínuo — Esc para sair".to_string(), String::new()];
         lines.extend(history.iter().cloned());
         if let Err(e) = tui::draw_lines(&mut screen, "Conexão", &lines) {
             break Err(e);
         }
 
         match tui::poll_key(Duration::from_secs(1)) {
-            Ok(Some(KeyCode::Esc)) | Ok(Some(KeyCode::Char('q'))) => break Ok(()),
+            Ok(Some(KeyCode::Esc)) => break Ok(()),
             Ok(_) => {}
             Err(e) => break Err(e),
         }
@@ -283,6 +286,11 @@ fn run_audio_test() -> Result<()> {
     Ok(())
 }
 
+/// Fluxo antigo (pareamento OTP manual via arquivo `pairing_code`) — não é
+/// mais chamado por nada (`run_device_flow` substituiu nas duas chamadas que
+/// existiam). Mantido sem apagar até a Etapa 6 (deprecar de vez, junto com o
+/// lado servidor em `/machine/pair`) — servidor ainda aceita esse fluxo.
+#[allow(dead_code)]
 async fn wait_for_pairing(cs_url: &str, fingerprint: &str, config_path: &PathBuf, settings: &LauncherSettings) -> Result<()> {
     let pairing_file = get_pairing_code_path()
         .context("Não foi possível determinar caminho do pairing_code")?;
@@ -338,6 +346,138 @@ async fn wait_for_pairing(cs_url: &str, fingerprint: &str, config_path: &PathBuf
             }
         }
     }
+}
+
+/// Espera até `duration`, checando Esc a cada 200ms (mesmo padrão de
+/// `run_video_test`). Retorna `true` se o operador cancelou.
+fn wait_or_cancel(duration: Duration) -> Result<bool> {
+    let deadline = std::time::Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        if let Some(KeyCode::Esc) = tui::poll_key(remaining.min(Duration::from_millis(200)))? {
+            return Ok(true);
+        }
+    }
+}
+
+/// Device flow (Etapa 5): launcher autorregistra (só `hardware_fingerprint`,
+/// sem local/sala/ilha — isso só se escolhe no backoffice, na aprovação),
+/// mostra o `user_code` na tela, faz polling até aprovado, salva config e
+/// sobe o jogo. Substitui o pareamento OTP antigo (`wait_for_pairing`) como
+/// o que "Configurar Máquina" chama — o fluxo antigo continua existindo no
+/// servidor, só não é mais chamado por aqui.
+async fn run_device_flow(
+    cs_url: &str,
+    fingerprint: &str,
+    config_path: &PathBuf,
+    settings: &LauncherSettings,
+) -> Result<()> {
+    let mut screen = tui::enter_screen()?;
+
+    let machine_type = hardware::video::detect_machine_type();
+
+    let registration = loop {
+        match api::register_device(cs_url, fingerprint, machine_type).await {
+            Ok(r) => break r,
+            Err(e) => {
+                tui::draw_lines(
+                    &mut screen,
+                    "Configurar Máquina",
+                    &[
+                        "Falha ao registrar no servidor:".to_string(),
+                        e.to_string(),
+                        String::new(),
+                        format!("Tentando de novo em {}s... (Esc cancela)", DEVICE_FLOW_RETRY_SECS),
+                    ],
+                )?;
+                if wait_or_cancel(Duration::from_secs(DEVICE_FLOW_RETRY_SECS))? {
+                    tui::leave_screen(screen)?;
+                    return Ok(());
+                }
+            }
+        }
+    };
+
+    let device_code = registration.device_code;
+    let user_code = registration.user_code;
+
+    let approved = loop {
+        tui::draw_lines(
+            &mut screen,
+            "Configurar Máquina",
+            &[
+                "Digite este código no backoffice para ativar a máquina:".to_string(),
+                String::new(),
+                format!("   {}   ", user_code),
+                String::new(),
+                "Aguardando aprovação do administrador... (Esc cancela)".to_string(),
+            ],
+        )?;
+
+        if wait_or_cancel(Duration::from_secs(DEVICE_FLOW_POLL_SECS))? {
+            tui::leave_screen(screen)?;
+            return Ok(());
+        }
+
+        match api::poll_device_token(cs_url, &device_code).await {
+            Ok(resp) if resp.registration_status == "approved" => break resp,
+            Ok(resp) if resp.registration_status == "expired" => {
+                tui::draw_lines(
+                    &mut screen,
+                    "Configurar Máquina",
+                    &["Código expirado. Registrando de novo...".to_string()],
+                )?;
+                sleep(Duration::from_secs(2)).await;
+                tui::leave_screen(screen)?;
+                return Box::pin(run_device_flow(cs_url, fingerprint, config_path, settings)).await;
+            }
+            Ok(_) => continue, // pending — segue no loop
+            Err(e) => {
+                tui::draw_lines(
+                    &mut screen,
+                    "Configurar Máquina",
+                    &[
+                        format!("Erro ao consultar status: {}", e),
+                        String::new(),
+                        "Tentando de novo... (Esc cancela)".to_string(),
+                    ],
+                )?;
+            }
+        }
+    };
+
+    tui::leave_screen(screen)?;
+
+    let machine_code = approved
+        .machine_code
+        .context("Resposta de aprovação sem machine_code")?;
+    let token = approved.token.context("Resposta de aprovação sem token")?;
+
+    let cfg = LauncherConfig {
+        machine_code: machine_code.clone(),
+        hardware_fingerprint: fingerprint.to_string(),
+        cs_url: cs_url.to_string(),
+        paired_at: chrono::Utc::now().to_rfc3339(),
+    };
+    save_config(config_path, &cfg).context("Falha ao salvar configuração após aprovação")?;
+    info!("Máquina ativada via device flow: {}", machine_code);
+
+    tokio::spawn({
+        let cs = cs_url.to_string();
+        let mc = machine_code.clone();
+        let cp = config_path.clone();
+        async move {
+            heartbeat_loop(&cs, &mc, &cp).await;
+        }
+    });
+
+    let exit_status = spawn_game_and_wait(&token, settings)?;
+    info!("Jogo encerrado (status: {}). Reiniciando...", exit_status);
+
+    Ok(())
 }
 
 async fn heartbeat_loop(cs_url: &str, machine_code: &str, _config_path: &PathBuf) {

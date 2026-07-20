@@ -1,6 +1,6 @@
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::KeyCode,
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -8,8 +8,40 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
+use std::cell::OnceCell;
 use std::io;
 use std::time::Duration;
+
+thread_local! {
+    /// Conexão com o buttonhub, aberta uma vez e reusada por todo `poll_key`/
+    /// `select` do processo (sempre chamados da thread principal, síncrona).
+    /// `None` se não conseguiu conectar (ex: rodando fora da VLT, em dev) —
+    /// nesse caso navegação cai só no teclado.
+    static BUTTONHUB: OnceCell<Option<crate::hardware::buttonhub::Connection>> = OnceCell::new();
+}
+
+fn with_buttonhub_events<T>(f: impl FnOnce(Option<&std::sync::mpsc::Receiver<String>>) -> T) -> T {
+    BUTTONHUB.with(|cell| {
+        let conn = cell.get_or_init(|| {
+            crate::hardware::buttonhub::connect(crate::hardware::buttonhub::DEFAULT_PORT).ok()
+        });
+        f(conn.as_ref().map(|c| &c.events))
+    })
+}
+
+/// Mapeamento das 4 teclas físicas usadas pra navegar o TUI (`ki`/`ke`/`ka`/`kg`
+/// vindas do buttonhub). Maiúscula (`KI` etc) é release — ignorada, só reage
+/// a press. Qualquer outra tecla física (noteiro `$`, heartbeat `!`, demais
+/// `kX`) não navega nada, fica livre pra função do jogo.
+fn map_button(line: &str) -> Option<KeyCode> {
+    match line {
+        "ki" => Some(KeyCode::Enter),
+        "ke" => Some(KeyCode::Esc),
+        "ka" => Some(KeyCode::Up),
+        "kg" => Some(KeyCode::Down),
+        _ => None,
+    }
+}
 
 pub enum MenuChoice {
     TestMachine,
@@ -50,9 +82,8 @@ where
 }
 
 /// Menu de lista genérico: setas navegam, Enter escolhe (retorna o índice),
-/// Esc/q volta `None`. Navegação por teclado por enquanto — troca pra ler as
-/// 8 teclas físicas da máquina fica pra quando o mapeamento de input real
-/// (`/dev/input/event*`) entrar.
+/// Esc volta `None`. Só as 4 teclas físicas do buttonhub (`ki`/`ke`/`ka`/`kg`,
+/// ver `map_button`) navegam — sem teclado externo, lidas por `poll_key`.
 pub fn select(title: &str, items: &[&str]) -> Result<Option<usize>> {
     with_screen(|terminal| {
         let mut selected = 0usize;
@@ -77,18 +108,12 @@ pub fn select(title: &str, items: &[&str]) -> Result<Option<usize>> {
                 f.render_widget(List::new(list_items).block(block), f.area());
             })?;
 
-            if event::poll(Duration::from_millis(200))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        match key.code {
-                            KeyCode::Up => selected = selected.saturating_sub(1),
-                            KeyCode::Down => selected = (selected + 1).min(items.len() - 1),
-                            KeyCode::Enter => break Some(selected),
-                            KeyCode::Esc | KeyCode::Char('q') => break None,
-                            _ => {}
-                        }
-                    }
-                }
+            match poll_key(Duration::from_millis(200))? {
+                Some(KeyCode::Up) => selected = selected.saturating_sub(1),
+                Some(KeyCode::Down) => selected = (selected + 1).min(items.len() - 1),
+                Some(KeyCode::Enter) => break Some(selected),
+                Some(KeyCode::Esc) => break None,
+                _ => {}
             }
         };
 
@@ -138,15 +163,24 @@ pub fn leave_screen(mut screen: Screen) -> Result<()> {
 }
 
 /// Tecla pressionada dentro de `timeout`, se houver (`None` = nada ainda).
+/// Só o buttonhub (`ki`/`ke`/`ka`/`kg`, ver `map_button`) conta — sem teclado
+/// externo. Sem buttonhub conectado, nunca retorna tecla nenhuma.
 pub fn poll_key(timeout: Duration) -> Result<Option<KeyCode>> {
-    if event::poll(timeout)? {
-        if let Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                return Ok(Some(key.code));
-            }
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        let from_buttonhub = with_buttonhub_events(|rx| {
+            rx.and_then(|rx| rx.try_iter().find_map(|line| map_button(&line)))
+        });
+        if from_buttonhub.is_some() {
+            return Ok(from_buttonhub);
         }
+
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
-    Ok(None)
 }
 
 pub fn draw_lines(screen: &mut Screen, title: &str, lines: &[String]) -> Result<()> {
@@ -218,7 +252,7 @@ pub fn run_video_test(displays: &[crate::hardware::video::Display], hold: Durati
             if let Err(e) = screen.draw(|f| {
                 for (region, display) in layout_for_displays(f.area(), displays) {
                     let text = format!(
-                        "{}\n{}x{}\n\n{}\n\nEsc/q para sair",
+                        "{}\n{}x{}\n\n{}\n\nEsc para sair",
                         display.name, display.width, display.height, color_name
                     );
                     let block = Paragraph::new(text)
@@ -237,7 +271,7 @@ pub fn run_video_test(displays: &[crate::hardware::video::Display], hold: Durati
                     break;
                 }
                 match poll_key(remaining.min(Duration::from_millis(100))) {
-                    Ok(Some(KeyCode::Esc)) | Ok(Some(KeyCode::Char('q'))) => break 'outer Ok(()),
+                    Ok(Some(KeyCode::Esc)) => break 'outer Ok(()),
                     Ok(_) => {}
                     Err(e) => break 'outer Err(e),
                 }
@@ -250,10 +284,19 @@ pub fn run_video_test(displays: &[crate::hardware::video::Display], hold: Durati
 }
 
 /// Mostra cru cada linha recebida em `rx` (ex: eventos do buttonhub), com
-/// histórico das últimas 20. Esc/q sai a qualquer momento.
+/// histórico das últimas 20. Essa tela existe pra testar CADA tecla física,
+/// incluindo a que também serve de "sair" (`ke`/Esc) — se ela saísse no
+/// primeiro toque o operador nunca conseguiria confirmar que ela funciona.
+/// Por isso Esc exige dois toques seguidos (dentro de `ESC_EXIT_WINDOW`) pra
+/// sair de fato; o primeiro só fica registrado no histórico normalmente e
+/// mostra o aviso "aperte de novo pra sair". Qualquer outra tecla no meio
+/// cancela essa confirmação pendente.
+const ESC_EXIT_WINDOW: Duration = Duration::from_millis(1200);
+
 pub fn run_event_stream(title: &str, rx: &std::sync::mpsc::Receiver<String>) -> Result<()> {
     let mut screen = enter_screen()?;
     let mut history: Vec<String> = Vec::new();
+    let mut esc_pending_since: Option<std::time::Instant> = None;
 
     let result: Result<()> = loop {
         while let Ok(line) = rx.try_recv() {
@@ -263,15 +306,30 @@ pub fn run_event_stream(title: &str, rx: &std::sync::mpsc::Receiver<String>) -> 
             }
         }
 
-        let mut lines = vec![format!("{} — Esc/q para sair", title), String::new()];
+        if esc_pending_since.is_some_and(|t| t.elapsed() > ESC_EXIT_WINDOW) {
+            esc_pending_since = None;
+        }
+
+        let hint = if esc_pending_since.is_some() {
+            "Esc detectado — aperte de novo pra sair"
+        } else {
+            "Esc duas vezes seguidas pra sair (1a só testa a tecla)"
+        };
+        let mut lines = vec![format!("{} — {}", title, hint), String::new()];
         lines.extend(history.iter().cloned());
         if let Err(e) = draw_lines(&mut screen, title, &lines) {
             break Err(e);
         }
 
         match poll_key(Duration::from_millis(100)) {
-            Ok(Some(KeyCode::Esc)) | Ok(Some(KeyCode::Char('q'))) => break Ok(()),
-            Ok(_) => {}
+            Ok(Some(KeyCode::Esc)) => {
+                if esc_pending_since.is_some() {
+                    break Ok(());
+                }
+                esc_pending_since = Some(std::time::Instant::now());
+            }
+            Ok(Some(_)) => esc_pending_since = None,
+            Ok(None) => {}
             Err(e) => break Err(e),
         }
     };
@@ -288,16 +346,12 @@ pub fn show_placeholder(title: &str, message: &str) -> Result<()> {
                 let block = Block::default()
                     .title(format!(" {} ", title))
                     .borders(Borders::ALL);
-                let text = format!("{}\n\nPressione qualquer tecla para voltar", message);
+                let text = format!("{}\n\nAperte qualquer tecla pra voltar", message);
                 f.render_widget(Paragraph::new(text).block(block), f.area());
             })?;
 
-            if event::poll(Duration::from_millis(200))? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press {
-                        break;
-                    }
-                }
+            if poll_key(Duration::from_millis(200))?.is_some() {
+                break;
             }
         }
         Ok(())

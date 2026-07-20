@@ -82,3 +82,46 @@ pub fn get_displays() -> Vec<Display> {
         y: 0,
     }]
 }
+
+/// Mapeamento puro (sem I/O), separado de `detect_machine_type` só pra dar
+/// pra testar sem depender de `xrandr`/hardware real.
+fn machine_type_for_display_count(count: usize) -> &'static str {
+    if count >= 2 {
+        "dual_screen"
+    } else {
+        "single_screen_vertical"
+    }
+}
+
+/// `machine_type` autodetectado pela quantidade de telas conectadas — 2 ou
+/// mais telas: `dual_screen`; 1 (ou o fallback sintético, sem X real):
+/// `single_screen_vertical`. Sem override manual por enquanto (decisão: só
+/// detecção, ver conversa/roadmap — pode ganhar tela de confirmação depois).
+pub fn detect_machine_type() -> &'static str {
+    machine_type_for_display_count(get_displays().len())
+}
+
+#[cfg(test)]
+mod machine_type_tests {
+    use super::*;
+
+    #[test]
+    fn zero_displays_is_single_screen_vertical() {
+        assert_eq!(machine_type_for_display_count(0), "single_screen_vertical");
+    }
+
+    #[test]
+    fn one_display_is_single_screen_vertical() {
+        assert_eq!(machine_type_for_display_count(1), "single_screen_vertical");
+    }
+
+    #[test]
+    fn two_displays_is_dual_screen() {
+        assert_eq!(machine_type_for_display_count(2), "dual_screen");
+    }
+
+    #[test]
+    fn more_than_two_displays_is_still_dual_screen() {
+        assert_eq!(machine_type_for_display_count(3), "dual_screen");
+    }
+}
