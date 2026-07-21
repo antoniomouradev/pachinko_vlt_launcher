@@ -23,7 +23,10 @@ Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-Environment="CS_URL=http://localhost:8888"
+Environment="CS_URL=https://pachinko.espindolasoftware.com.br"
+Environment="GAME_REGISTRY_URL=http://192.168.15.12:8090"
+Environment="DISPLAY=:0.0"
+Environment="XAUTHORITY=/home/game/.Xauthority"
 Environment="RUST_LOG=info"
 
 [Install]

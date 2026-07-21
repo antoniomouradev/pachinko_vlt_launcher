@@ -8,8 +8,9 @@ license = "PROPRIETARY"
 
 [dependencies]
 # HTTP Client
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.11", features = ["json", "stream"] }
 tokio = { version = "1.0", features = ["full"] }
+futures-util = "0.3"
 
 # Serialização JSON
 serde = { version = "1.0", features = ["derive"] }
@@ -40,6 +41,10 @@ hostname = "0.4"
 
 # Hardware fingerprint
 sha2 = "0.10"
+
+# Download + extração do jogo (tar.gz em memória, direto pro tmpfs)
+tar = "0.4"
+flate2 = "1.0"
 
 # TUI
 ratatui = "0.28"

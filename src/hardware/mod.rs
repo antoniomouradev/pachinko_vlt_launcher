@@ -12,15 +12,17 @@ use sha2::{Sha256, Digest};
 #[derive(Debug, Clone, Serialize)]
 pub struct HardwareInfo {
     pub mac_address: String,
-    /// BIOS UUID (`dmidecode -t system`, campo UUID) — gravado na
+    /// BIOS UUID (`/sys/class/dmi/id/product_uuid`) — gravado na
     /// motherboard, sobrevive reinstall do SO (diferente do `/etc/machine-id`
-    /// usado antes, que é gerado pelo SO e muda a cada reinstall).
+    /// usado antes, que é gerado pelo SO e muda a cada reinstall). Lido via
+    /// sysfs direto, sem depender do binário `dmidecode` (mesma fonte).
     pub bios_uuid: String,
-    /// Serial da motherboard (`dmidecode -t baseboard`).
+    /// Serial da motherboard (`/sys/class/dmi/id/board_serial`).
     pub baseboard_serial: String,
-    /// Processor ID real (`dmidecode -t processor`, campo ID) — não
-    /// confundir com `processor` abaixo, que é só a string do modelo
-    /// (igual em toda máquina do mesmo modelo, não serve de identidade).
+    /// Processor ID real (EAX+EDX de `CPUID(eax=1)`, mesmo valor que o
+    /// campo SMBIOS "ID" reporta) — não confundir com `processor` abaixo,
+    /// que é só a string do modelo (igual em toda máquina do mesmo modelo,
+    /// não serve de identidade).
     pub cpu_id: String,
     pub disk_serials: Vec<String>,
     pub processor: String,

@@ -3,6 +3,12 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::process::Command;
 
+/// Caminhos sysfs equivalentes ao que `dmidecode` lia via `/dev/mem` —
+/// mesma fonte (BIOS/SMBIOS cacheado pelo kernel), sem depender de binário
+/// externo. Continuam exigindo root (arquivos são `0400 root` no kernel).
+const SYS_PRODUCT_UUID: &str = "/sys/class/dmi/id/product_uuid";
+const SYS_BOARD_SERIAL: &str = "/sys/class/dmi/id/board_serial";
+
 pub fn collect() -> Result<HardwareInfo> {
     let hostname = hostname::get()
         .context("Falha ao obter hostname")?
@@ -13,13 +19,13 @@ pub fn collect() -> Result<HardwareInfo> {
         .context("Falha ao obter MAC address")?;
 
     let bios_uuid = get_bios_uuid()
-        .context("Falha ao obter BIOS UUID via dmidecode")?;
+        .context("Falha ao obter BIOS UUID via sysfs")?;
 
     let baseboard_serial = get_baseboard_serial()
-        .context("Falha ao obter Serial Number da motherboard via dmidecode")?;
+        .context("Falha ao obter Serial Number da motherboard via sysfs")?;
 
     let cpu_id = get_cpu_id()
-        .context("Falha ao obter Processor ID via dmidecode")?;
+        .context("Falha ao obter Processor ID via CPUID")?;
 
     let disk_serials = get_disk_serials()
         .unwrap_or_else(|_| vec![]);
@@ -39,62 +45,68 @@ pub fn collect() -> Result<HardwareInfo> {
     })
 }
 
-/// Roda `dmidecode -t <dmi_type>` e devolve a saída crua (stdout).
-/// Exige root — se o processo não tiver privilégio suficiente, dmidecode
-/// sai com erro/saída vazia e isso vira `Err` aqui.
-fn run_dmidecode(dmi_type: &str) -> Result<String> {
-    let output = Command::new("dmidecode")
-        .args(&["-t", dmi_type])
-        .output()
-        .context("Falha ao executar dmidecode (precisa de root)")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("dmidecode -t {} falhou: {}", dmi_type, stderr);
+/// Filtra placeholders comuns de BIOS/motherboard genérica ou virtualizada
+/// ("Not Specified", "To Be Filled By O.E.M.", vazio, UUID zerado) — não
+/// são valor real de identidade.
+fn validate_dmi_value(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    let hex_digits: String = value.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    let all_zero = !hex_digits.is_empty() && hex_digits.chars().all(|c| c == '0');
+    if value.is_empty()
+        || value.eq_ignore_ascii_case("Not Specified")
+        || value.eq_ignore_ascii_case("To Be Filled By O.E.M.")
+        || value.eq_ignore_ascii_case("None")
+        || all_zero
+    {
+        None
+    } else {
+        Some(value.to_string())
     }
-
-    String::from_utf8(output.stdout).context("Falha ao decodificar saída do dmidecode")
 }
 
-/// Parser puro (sem I/O) do formato `dmidecode`: linhas `\tCampo: valor`.
-/// Filtra placeholders comuns de BIOS/motherboard genérica ou virtualizada
-/// ("Not Specified", "To Be Filled By O.E.M.", vazio) — não são valor real.
-fn parse_dmi_field(output: &str, field: &str) -> Option<String> {
-    let prefix = format!("{}:", field);
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if let Some(value) = trimmed.strip_prefix(&prefix) {
-            let value = value.trim();
-            let hex_digits: String = value.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-            let all_zero = !hex_digits.is_empty() && hex_digits.chars().all(|c| c == '0');
-            if value.is_empty()
-                || value.eq_ignore_ascii_case("Not Specified")
-                || value.eq_ignore_ascii_case("To Be Filled By O.E.M.")
-                || value.eq_ignore_ascii_case("None")
-                || all_zero
-            {
-                return None;
-            }
-            return Some(value.to_string());
-        }
-    }
-    None
+/// Lê direto do sysfs (mesma fonte que `dmidecode` usava por baixo) —
+/// sem shell-out, sem depender de pacote externo instalado. Continua
+/// exigindo root: o kernel restringe esses arquivos a `0400 root`.
+fn read_sys_dmi(path: &str) -> Result<String> {
+    fs::read_to_string(path)
+        .with_context(|| format!("Falha ao ler {} (precisa de root)", path))
 }
 
 fn get_bios_uuid() -> Result<String> {
-    let output = run_dmidecode("system")?;
-    parse_dmi_field(&output, "UUID").context("Campo UUID não encontrado/vazio em dmidecode -t system")
+    let raw = read_sys_dmi(SYS_PRODUCT_UUID)?;
+    validate_dmi_value(&raw)
+        .with_context(|| format!("UUID vazio/placeholder em {}", SYS_PRODUCT_UUID))
 }
 
 fn get_baseboard_serial() -> Result<String> {
-    let output = run_dmidecode("baseboard")?;
-    parse_dmi_field(&output, "Serial Number")
-        .context("Campo Serial Number não encontrado/vazio em dmidecode -t baseboard")
+    let raw = read_sys_dmi(SYS_BOARD_SERIAL)?;
+    validate_dmi_value(&raw)
+        .with_context(|| format!("Serial Number vazio/placeholder em {}", SYS_BOARD_SERIAL))
 }
 
+/// O campo "Processor ID" do SMBIOS é, por spec, a concatenação crua de
+/// EAX+EDX da instrução `CPUID(eax=1)` cacheada pela BIOS — dá pra pedir
+/// esse mesmo valor direto, sem dmidecode e **sem precisar de root**
+/// (CPUID é instrução não-privilegiada).
+#[cfg(target_arch = "x86_64")]
 fn get_cpu_id() -> Result<String> {
-    let output = run_dmidecode("processor")?;
-    parse_dmi_field(&output, "ID").context("Campo ID não encontrado/vazio em dmidecode -t processor")
+    let result = unsafe { std::arch::x86_64::__cpuid(1) };
+    let bytes: Vec<u8> = result
+        .eax
+        .to_le_bytes()
+        .into_iter()
+        .chain(result.edx.to_le_bytes())
+        .collect();
+    Ok(bytes
+        .iter()
+        .map(|b| format!("{:02X}", b))
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn get_cpu_id() -> Result<String> {
+    anyhow::bail!("Processor ID via CPUID só suportado em x86_64")
 }
 
 /// Serial físico do disco (não muda ao reformatar, diferente do UUID de
@@ -167,104 +179,52 @@ fn get_mac_address() -> Result<String> {
 }
 
 #[cfg(test)]
-mod dmi_parsing_tests {
+mod dmi_validation_tests {
     use super::*;
 
-    const SYSTEM_INFO_SAMPLE: &str = "\
-# dmidecode 3.3
-Getting SMBIOS data from sysfs.
-SMBIOS 2.8 present.
-
-Handle 0x0001, DMI type 1, 27 bytes
-System Information
-\tManufacturer: Dell Inc.
-\tProduct Name: OptiPlex 7090
-\tVersion: Not Specified
-\tSerial Number: ABCD123
-\tUUID: 4c4c4544-0043-3610-8058-b9c04f503332
-\tWake-up Type: Power Switch
-\tSKU Number:
-\tFamily:
-";
-
-    const BASEBOARD_SAMPLE: &str = "\
-Handle 0x0002, DMI type 2, 15 bytes
-Base Board Information
-\tManufacturer: Dell Inc.
-\tProduct Name: 0ABC123
-\tVersion: A01
-\tSerial Number: .XYZ456.
-\tAsset Tag: Not Specified
-\tFeatures:
-\t\tBoard is a hosting board
-\tLocation In Chassis: Not Specified
-";
-
-    const PROCESSOR_SAMPLE: &str = "\
-Handle 0x0004, DMI type 4, 42 bytes
-Processor Information
-\tSocket Designation: CPU1
-\tType: Central Processor
-\tFamily: Core i7
-\tManufacturer: Intel(R) Corporation
-\tID: A9 06 08 00 FF FB EB BF
-\tVersion: Intel(R) Core(TM) i7-9700 CPU @ 3.00GHz
-\tVoltage: 1.2 V
-";
-
-    const VM_SYSTEM_INFO_SAMPLE: &str = "\
-Handle 0x0001, DMI type 1, 27 bytes
-System Information
-\tManufacturer: QEMU
-\tProduct Name: Standard PC
-\tVersion: pc-i440fx-2.1
-\tSerial Number: Not Specified
-\tUUID: 00000000-0000-0000-0000-000000000000
-\tWake-up Type: Power Switch
-";
-
     #[test]
-    fn parses_bios_uuid_from_system_info() {
-        let uuid = parse_dmi_field(SYSTEM_INFO_SAMPLE, "UUID");
+    fn accepts_real_uuid() {
+        let uuid = validate_dmi_value("4c4c4544-0043-3610-8058-b9c04f503332\n");
         assert_eq!(uuid.as_deref(), Some("4c4c4544-0043-3610-8058-b9c04f503332"));
     }
 
     #[test]
-    fn parses_baseboard_serial() {
-        let serial = parse_dmi_field(BASEBOARD_SAMPLE, "Serial Number");
+    fn accepts_real_serial() {
+        let serial = validate_dmi_value(".XYZ456.\n");
         assert_eq!(serial.as_deref(), Some(".XYZ456."));
     }
 
     #[test]
-    fn parses_cpu_id() {
-        let id = parse_dmi_field(PROCESSOR_SAMPLE, "ID");
-        assert_eq!(id.as_deref(), Some("A9 06 08 00 FF FB EB BF"));
-    }
-
-    #[test]
-    fn rejects_placeholder_serial_number() {
-        // Version na system info é "Not Specified" — deve virar None, não string literal
-        let version = parse_dmi_field(SYSTEM_INFO_SAMPLE, "Version");
-        assert_eq!(version, None);
+    fn rejects_placeholder_value() {
+        assert_eq!(validate_dmi_value("Not Specified\n"), None);
+        assert_eq!(validate_dmi_value("To Be Filled By O.E.M.\n"), None);
+        assert_eq!(validate_dmi_value("None\n"), None);
     }
 
     #[test]
     fn rejects_all_zero_uuid_from_vm() {
         // UUID zerado é comum em VM/placa genérica sem SMBIOS de verdade preenchido —
         // não é identidade real, tratar como ausente
-        let uuid = parse_dmi_field(VM_SYSTEM_INFO_SAMPLE, "UUID");
+        let uuid = validate_dmi_value("00000000-0000-0000-0000-000000000000\n");
         assert_eq!(uuid, None);
     }
 
     #[test]
-    fn missing_field_returns_none() {
-        let missing = parse_dmi_field(SYSTEM_INFO_SAMPLE, "Asset Tag");
-        assert_eq!(missing, None);
+    fn rejects_empty_value() {
+        assert_eq!(validate_dmi_value("\n"), None);
+        assert_eq!(validate_dmi_value(""), None);
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
-    fn empty_field_value_returns_none() {
-        let sku = parse_dmi_field(SYSTEM_INFO_SAMPLE, "SKU Number");
-        assert_eq!(sku, None);
+    fn cpu_id_matches_expected_format() {
+        // Formato: 8 bytes hex maiúsculo separados por espaço (EAX+EDX de CPUID(1))
+        let id = get_cpu_id().expect("CPUID(1) deve funcionar em qualquer x86_64");
+        let parts: Vec<&str> = id.split(' ').collect();
+        assert_eq!(parts.len(), 8);
+        for part in parts {
+            assert_eq!(part.len(), 2);
+            assert!(part.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_lowercase()));
+        }
     }
 }

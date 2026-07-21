@@ -56,7 +56,7 @@ pub enum TestChoice {
     Connection,
 }
 
-const MENU_ITEMS: [&str; 3] = ["Testar Máquina", "Configurar Máquina", "Desligar"];
+const MENU_ITEMS: [&str; 3] = ["Testar Máquina", "Registrar Máquina", "Desligar"];
 
 const TEST_ITEMS: [&str; 4] = ["Testar Inputs", "Som", "Vídeo", "Conexão"];
 
@@ -118,6 +118,94 @@ pub fn select(title: &str, items: &[&str]) -> Result<Option<usize>> {
         };
 
         Ok(choice)
+    })
+}
+
+/// Fonte grande em blocos (5 linhas) pra cada dígito 0-9 — o número digitado
+/// precisa ser lido de longe na VLT física, texto normal de terminal é
+/// pequeno demais.
+const DIGIT_GLYPHS: [[&str; 5]; 10] = [
+    [" ███ ", "█   █", "█   █", "█   █", " ███ "], // 0
+    ["  █  ", " ██  ", "  █  ", "  █  ", " ███ "], // 1
+    [" ███ ", "█   █", "   █ ", "  █  ", "█████"], // 2
+    ["█████", "    █", "  ██ ", "    █", "█████"], // 3
+    ["█   █", "█   █", "█████", "    █", "    █"], // 4
+    ["█████", "█    ", "████ ", "    █", "████ "], // 5
+    [" ███ ", "█    ", "████ ", "█   █", " ███ "], // 6
+    ["█████", "    █", "   █ ", "  █  ", "  █  "], // 7
+    [" ███ ", "█   █", " ███ ", "█   █", " ███ "], // 8
+    [" ███ ", "█   █", " ████", "    █", " ███ "], // 9
+];
+
+/// Entrada numérica dígito a dígito, só com as 2 teclas físicas que existem
+/// pra isso: `ka` (seta pra cima) soma 1 no dígito atual (0-9, dá a volta
+/// pro 0 depois do 9), `ki` (Enter) confirma o dígito e avança pro próximo;
+/// no último dígito, confirma a entrada inteira. `ke` (Esc) cancela tudo.
+/// Sem tecla de "voltar" — errou dígito, digita até dar a volta de novo.
+/// Dígitos em fonte grande, centralizados na tela (ver `DIGIT_GLYPHS`).
+pub fn enter_digits(title: &str, num_digits: usize) -> Result<Option<String>> {
+    with_screen(|terminal| {
+        let mut digits = vec![0u8; num_digits];
+        let mut pos = 0usize;
+
+        let result = loop {
+            terminal.draw(|f| {
+                let area = f.area();
+                let block = Block::default()
+                    .title(format!(" {} ", title))
+                    .borders(Borders::ALL);
+                let inner = block.inner(area);
+                f.render_widget(block, area);
+
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Min(1),
+                        Constraint::Length(5),
+                        Constraint::Length(2),
+                        Constraint::Min(1),
+                    ])
+                    .split(inner);
+
+                let glyph_lines: Vec<Line> = (0..5)
+                    .map(|row| {
+                        let mut spans = Vec::with_capacity(digits.len() * 2);
+                        for (i, &d) in digits.iter().enumerate() {
+                            let style = if i == pos {
+                                Style::default().add_modifier(Modifier::BOLD).fg(Color::Yellow)
+                            } else {
+                                Style::default()
+                            };
+                            spans.push(Span::styled(DIGIT_GLYPHS[d as usize][row], style));
+                            spans.push(Span::raw("  "));
+                        }
+                        Line::from(spans)
+                    })
+                    .collect();
+
+                f.render_widget(Paragraph::new(glyph_lines).alignment(Alignment::Center), chunks[1]);
+                f.render_widget(
+                    Paragraph::new("seta pra cima muda o dígito, Enter confirma e avança")
+                        .alignment(Alignment::Center),
+                    chunks[2],
+                );
+            })?;
+
+            match poll_key(Duration::from_millis(200))? {
+                Some(KeyCode::Up) => digits[pos] = (digits[pos] + 1) % 10,
+                Some(KeyCode::Enter) => {
+                    if pos + 1 == num_digits {
+                        let value: String = digits.iter().map(|d| d.to_string()).collect();
+                        break Some(value);
+                    }
+                    pos += 1;
+                }
+                Some(KeyCode::Esc) => break None,
+                _ => {}
+            }
+        };
+
+        Ok(result)
     })
 }
 

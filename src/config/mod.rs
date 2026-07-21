@@ -3,12 +3,25 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+fn default_game_registry_url() -> String {
+    "http://192.168.15.12:8090".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LauncherSettings {
     pub cs_url: String,
     pub game_path: String,
     #[serde(default)]
     pub game_args: Vec<String>,
+    /// Base do `game_registry_service` — de onde o jogo é baixado (RAM,
+    /// nunca disco) a cada boot. `game_path` acima fica só pro fluxo antigo
+    /// (binário já parado no disco), não usado quando o download funciona.
+    #[serde(default = "default_game_registry_url")]
+    pub game_registry_url: String,
+}
+
+fn default_machine_variant() -> String {
+    "vlt".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +30,10 @@ pub struct LauncherConfig {
     pub hardware_fingerprint: String,
     pub cs_url: String,
     pub paired_at: String,
+    /// `vlt`/`street`, decide qual build o `game_registry_service` serve.
+    /// Default `vlt` pra configs salvos antes desse campo existir.
+    #[serde(default = "default_machine_variant")]
+    pub machine_variant: String,
 }
 
 pub fn get_config_path() -> Result<PathBuf> {

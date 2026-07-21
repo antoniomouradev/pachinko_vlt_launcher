@@ -26,25 +26,63 @@ pub struct TokenResponse {
     pub coin_list: Vec<u32>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct DeviceRegisterResponse {
-    pub status: String,
-    pub device_code: String,
-    pub user_code: String,
-    #[serde(default)]
-    pub registration_status: String,
-    #[serde(default)]
-    pub expires_in: Option<u64>,
-    #[serde(default)]
-    pub expires_at: Option<String>,
+#[derive(Debug, Clone, Deserialize)]
+pub struct IslandInfo {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RoomInfo {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LocationInfo {
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct DeviceTokenResponse {
+struct LookupCodeEnvelope {
+    status: String,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    location: Option<LocationInfo>,
+    #[serde(default)]
+    room: Option<RoomInfo>,
+    #[serde(default)]
+    islands: Vec<IslandInfo>,
+    #[serde(default = "default_machine_variant")]
+    machine_variant: String,
+}
+
+fn default_machine_variant() -> String {
+    "vlt".to_string()
+}
+
+/// Resultado de `GET /device/lookup_code` — a sala/local resolvidos a partir
+/// da faixa numérica em que o código caiu, e as ilhas dessa sala pra TUI
+/// oferecer como escolha (não existe dropdown de local/sala, só de ilha).
+/// `machine_variant` (`vlt`/`street`) vem da sala — decide qual build o
+/// launcher vai pedir ao game_registry_service mais tarde.
+#[derive(Debug, Clone)]
+pub struct RoomLookup {
+    pub location: LocationInfo,
+    pub room: RoomInfo,
+    pub islands: Vec<IslandInfo>,
+    pub machine_variant: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DeviceActivateResponse {
     pub status: String,
-    pub registration_status: String,
     #[serde(default)]
     pub machine_code: Option<String>,
+    #[serde(default)]
+    pub display_label: Option<String>,
     #[serde(default)]
     pub token: Option<String>,
     #[serde(default)]
@@ -54,16 +92,19 @@ pub struct DeviceTokenResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct DeviceRegisterRequest<'a> {
+struct LookupCodeRequest<'a> {
+    machine_code: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct DeviceActivateRequest<'a> {
+    machine_code: &'a str,
     hardware_fingerprint: &'a str,
     /// Autodetectado por `hardware::video::detect_machine_type()` — não é
     /// escolhido pelo operador (ver `hardware/video.rs`).
     machine_type: &'a str,
-}
-
-#[derive(Debug, Serialize)]
-struct DeviceTokenRequest<'a> {
-    device_code: &'a str,
+    id_island: &'a str,
+    position: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -156,60 +197,147 @@ pub async fn check_connection() -> Result<std::time::Duration> {
     Ok(start.elapsed())
 }
 
-/// POST /device/register — autorregistro (device flow). Reenviar o mesmo
-/// `fingerprint` depois de já registrado devolve o mesmo `user_code`, não
-/// gera um novo (comportamento do servidor).
-pub async fn register_device(cs_url: &str, fingerprint: &str, machine_type: &str) -> Result<DeviceRegisterResponse> {
+/// POST /device/lookup_code — resolve o código de 4 dígitos digitado pelo
+/// operador pra sala/local (via faixa cadastrada na sala) + lista de ilhas
+/// dessa sala. 404 = código fora de qualquer faixa cadastrada.
+pub async fn lookup_code(cs_url: &str, machine_code: &str) -> Result<RoomLookup> {
     let client = build_client()?;
-    let url = format!("{}/device/register", cs_url);
+    let url = format!("{}/device/lookup_code", cs_url);
 
     let resp = client
         .post(&url)
-        .json(&DeviceRegisterRequest { hardware_fingerprint: fingerprint, machine_type })
+        .json(&LookupCodeRequest { machine_code })
         .send()
         .await
         .with_context(|| format!("Falha ao conectar ao CS em {}", url))?;
 
     let status = resp.status();
     if status.is_success() {
-        resp.json::<DeviceRegisterResponse>().await.context("Falha ao decodificar resposta de device/register")
+        let envelope = resp
+            .json::<LookupCodeEnvelope>()
+            .await
+            .context("Falha ao decodificar resposta de device/lookup_code")?;
+        let location = envelope.location.context("Resposta de lookup_code sem location")?;
+        let room = envelope.room.context("Resposta de lookup_code sem room")?;
+        Ok(RoomLookup { location, room, islands: envelope.islands, machine_variant: envelope.machine_variant })
     } else {
-        let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("register_device HTTP {}: {}", status, body)
+        let body = resp
+            .json::<LookupCodeEnvelope>()
+            .await
+            .ok()
+            .and_then(|e| e.message)
+            .unwrap_or_else(|| status.to_string());
+        anyhow::bail!("lookup_code HTTP {}: {}", status, body)
     }
 }
 
-/// POST /device/token — poll até aprovado. 429 (rate limit do próprio
-/// servidor, ~3s entre polls) é tratado como "ainda pendente", não como erro
-/// — quem decide o intervalo entre chamadas é o chamador (`run_device_flow`).
-pub async fn poll_device_token(cs_url: &str, device_code: &str) -> Result<DeviceTokenResponse> {
+/// POST /device/activate — cria a máquina e ativa na hora, sem
+/// backoffice/aprovação. Idempotente: reenviar o mesmo `machine_code` já
+/// ativado (mesmo fingerprint) devolve o mesmo token em vez de duplicar.
+pub async fn activate_device(
+    cs_url: &str,
+    machine_code: &str,
+    fingerprint: &str,
+    machine_type: &str,
+    id_island: &str,
+    position: u32,
+) -> Result<DeviceActivateResponse> {
     let client = build_client()?;
-    let url = format!("{}/device/token", cs_url);
+    let url = format!("{}/device/activate", cs_url);
 
     let resp = client
         .post(&url)
-        .json(&DeviceTokenRequest { device_code })
+        .json(&DeviceActivateRequest {
+            machine_code,
+            hardware_fingerprint: fingerprint,
+            machine_type,
+            id_island,
+            position,
+        })
         .send()
         .await
         .with_context(|| format!("Falha ao conectar ao CS em {}", url))?;
 
     let status = resp.status();
-    if status.as_u16() == 429 {
-        return Ok(DeviceTokenResponse {
-            status: "ok".to_string(),
-            registration_status: "pending".to_string(),
-            machine_code: None,
-            token: None,
-            rgs_url: None,
-            rgs_port: None,
-        });
-    }
     if status.is_success() {
-        resp.json::<DeviceTokenResponse>().await.context("Falha ao decodificar resposta de device/token")
+        resp.json::<DeviceActivateResponse>().await.context("Falha ao decodificar resposta de device/activate")
     } else {
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("poll_device_token HTTP {}: {}", status, body)
+        anyhow::bail!("activate_device HTTP {}: {}", status, body)
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GameLatestResponse {
+    pub game_type: String,
+    #[allow(dead_code)]
+    pub variant: String,
+    pub version: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub download_url: String,
+}
+
+/// GET {registry}/game/latest?game_type=X&variant=Y — versão mais recente
+/// publicada, com hash pra conferir depois do download.
+pub async fn get_latest_build(registry_url: &str, game_type: &str, variant: &str) -> Result<GameLatestResponse> {
+    let client = build_client()?;
+    let url = format!("{}/game/latest", registry_url);
+
+    let resp = client
+        .get(&url)
+        .query(&[("game_type", game_type), ("variant", variant)])
+        .send()
+        .await
+        .with_context(|| format!("Falha ao conectar ao game_registry em {}", url))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        resp.json::<GameLatestResponse>().await.context("Falha ao decodificar resposta de game/latest")
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("get_latest_build HTTP {}: {}", status, body)
+    }
+}
+
+/// Baixa o pacote inteiro pra memória (nunca disco) — builds ficam na casa
+/// de centenas de MB, timeout maior que o client padrão de 30s.
+/// Baixa em stream (nunca no disco, só acumula em memória) chamando
+/// `on_progress(baixado_ate_agora, total_se_conhecido)` a cada chunk — quem
+/// chama decide com que frequência desenha isso na tela.
+pub async fn download_bytes_with_progress(
+    url: &str,
+    mut on_progress: impl FnMut(u64, Option<u64>),
+) -> Result<Vec<u8>> {
+    use futures_util::StreamExt;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .context("Falha ao criar cliente HTTP")?;
+
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("Falha ao baixar {}", url))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("download HTTP {}", status);
+    }
+
+    let total = resp.content_length();
+    let mut buf: Vec<u8> = Vec::with_capacity(total.unwrap_or(0) as usize);
+    let mut stream = resp.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Falha ao ler chunk do download")?;
+        buf.extend_from_slice(&chunk);
+        on_progress(buf.len() as u64, total);
+    }
+
+    Ok(buf)
 }
 
 pub async fn send_heartbeat(cs_url: &str, machine_code: &str) -> Result<()> {
@@ -236,96 +364,73 @@ mod device_flow_tests {
     use super::*;
 
     #[tokio::test]
-    async fn register_device_parses_pending_response() {
+    async fn lookup_code_parses_room_and_islands() {
         let mut server = mockito::Server::new_async().await;
         let _m = server
-            .mock("POST", "/device/register")
+            .mock("POST", "/device/lookup_code")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"status":"ok","device_code":"abc123","user_code":"WXYZ-1234","registration_status":"pending","expires_in":900}"#)
+            .with_body(
+                r#"{"status":"ok",
+                     "location":{"id":"L1","name":"Stock"},
+                     "room":{"id":"R1","name":"Sala 1"},
+                     "islands":[{"id":"I1","name":"Ilha 1"},{"id":"I2","name":"Ilha 2"}]}"#,
+            )
             .create_async()
             .await;
 
-        let resp = register_device(&server.url(), "fp-teste", "dual_screen").await.unwrap();
-        assert_eq!(resp.device_code, "abc123");
-        assert_eq!(resp.user_code, "WXYZ-1234");
+        let lookup = lookup_code(&server.url(), "8005").await.unwrap();
+        assert_eq!(lookup.room.name, "Sala 1");
+        assert_eq!(lookup.islands.len(), 2);
     }
 
     #[tokio::test]
-    async fn register_device_same_fingerprint_returns_existing_code() {
+    async fn lookup_code_out_of_range_is_error() {
         let mut server = mockito::Server::new_async().await;
         let _m = server
-            .mock("POST", "/device/register")
-            .with_status(200)
+            .mock("POST", "/device/lookup_code")
+            .with_status(404)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"status":"ok","device_code":"abc123","user_code":"WXYZ-1234","registration_status":"approved"}"#)
+            .with_body(r#"{"status":"fail","message":"no room for this code"}"#)
             .create_async()
             .await;
 
-        let resp = register_device(&server.url(), "fp-ja-conhecido", "single_screen_vertical").await.unwrap();
-        assert_eq!(resp.registration_status, "approved");
+        let result = lookup_code(&server.url(), "9999").await;
+        assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn poll_device_token_pending() {
+    async fn activate_device_returns_token() {
         let mut server = mockito::Server::new_async().await;
         let _m = server
-            .mock("POST", "/device/token")
-            .with_status(200)
+            .mock("POST", "/device/activate")
+            .with_status(201)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"status":"ok","registration_status":"pending"}"#)
+            .with_body(
+                r#"{"status":"ok","machine_code":"8005","display_label":"STK-S1-I1-001",
+                     "token":"TOK123","rgs_url":"http://rgs","rgs_port":43310}"#,
+            )
             .create_async()
             .await;
 
-        let resp = poll_device_token(&server.url(), "device-code-1").await.unwrap();
-        assert_eq!(resp.registration_status, "pending");
-        assert!(resp.token.is_none());
-    }
-
-    #[tokio::test]
-    async fn poll_device_token_approved_has_token() {
-        let mut server = mockito::Server::new_async().await;
-        let _m = server
-            .mock("POST", "/device/token")
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"status":"ok","registration_status":"approved","machine_code":"LAB-M-99","token":"TOK123","rgs_url":"http://rgs","rgs_port":43310}"#)
-            .create_async()
-            .await;
-
-        let resp = poll_device_token(&server.url(), "device-code-1").await.unwrap();
-        assert_eq!(resp.registration_status, "approved");
-        assert_eq!(resp.machine_code.as_deref(), Some("LAB-M-99"));
+        let resp = activate_device(&server.url(), "8005", "fp-teste", "dual_screen", "I1", 3)
+            .await
+            .unwrap();
+        assert_eq!(resp.machine_code.as_deref(), Some("8005"));
         assert_eq!(resp.token.as_deref(), Some("TOK123"));
     }
 
     #[tokio::test]
-    async fn poll_device_token_rate_limited_treated_as_pending() {
+    async fn activate_device_conflict_is_error() {
         let mut server = mockito::Server::new_async().await;
         let _m = server
-            .mock("POST", "/device/token")
-            .with_status(429)
-            .with_header("content-type", "application/json")
-            .with_body(r#"{"status":"fail","message":"polling too fast","retry_after":3}"#)
+            .mock("POST", "/device/activate")
+            .with_status(409)
+            .with_body(r#"{"status":"fail","message":"code already used by another device"}"#)
             .create_async()
             .await;
 
-        // 429 não deve virar Err — o chamador (run_device_flow) trata como "ainda pendente"
-        let resp = poll_device_token(&server.url(), "device-code-1").await.unwrap();
-        assert_eq!(resp.registration_status, "pending");
-    }
-
-    #[tokio::test]
-    async fn poll_device_token_not_found_is_error() {
-        let mut server = mockito::Server::new_async().await;
-        let _m = server
-            .mock("POST", "/device/token")
-            .with_status(404)
-            .with_body(r#"{"status":"fail","message":"device_code not found"}"#)
-            .create_async()
-            .await;
-
-        let result = poll_device_token(&server.url(), "device-code-inexistente").await;
+        let result = activate_device(&server.url(), "8005", "fp-outra", "dual_screen", "I1", 1).await;
         assert!(result.is_err());
     }
 }

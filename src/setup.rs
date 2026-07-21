@@ -20,7 +20,7 @@ pub fn run_setup(args: SetupArgs) -> Result<()> {
         Some(v) => v,
         None => Input::new()
             .with_prompt("URL do servidor CS")
-            .default("http://localhost:8888".to_string())
+            .default("https://pachinko.espindolasoftware.com.br".to_string())
             .interact_text()
             .context("Falha ao ler CS URL")?,
     };
@@ -39,7 +39,10 @@ pub fn run_setup(args: SetupArgs) -> Result<()> {
         None => Input::new()
             .with_prompt("Argumentos extras do jogo (deixe vazio se nenhum)")
             .allow_empty(true)
-            .default(String::new())
+            .default(
+                "-release -- --env=prod --channel web --layout=stacked_dual --button-hub --top-header-font"
+                    .to_string(),
+            )
             .interact_text()
             .context("Falha ao ler argumentos do jogo")?,
     };
@@ -48,6 +51,12 @@ pub fn run_setup(args: SetupArgs) -> Result<()> {
         .split_whitespace()
         .map(String::from)
         .collect();
+
+    let game_registry_url: String = Input::new()
+        .with_prompt("URL do game_registry_service (de onde o jogo é baixado)")
+        .default("http://192.168.15.12:8090".to_string())
+        .interact_text()
+        .context("Falha ao ler URL do game_registry_service")?;
 
     let pairing_code = match args.pairing_code {
         Some(v) => Some(v),
@@ -72,6 +81,7 @@ pub fn run_setup(args: SetupArgs) -> Result<()> {
     println!("\n--- Resumo ---");
     println!("  CS URL    : {}", cs_url);
     println!("  Jogo      : {}", game_path);
+    println!("  Registry  : {}", game_registry_url);
     if !game_args.is_empty() {
         println!("  Args      : {}", game_args.join(" "));
     }
@@ -91,7 +101,7 @@ pub fn run_setup(args: SetupArgs) -> Result<()> {
         return Ok(());
     }
 
-    let settings = LauncherSettings { cs_url, game_path, game_args };
+    let settings = LauncherSettings { cs_url, game_path, game_args, game_registry_url };
     let settings_path = get_settings_path()?;
     save_settings(&settings_path, &settings)
         .context("Falha ao salvar launcher_settings.json")?;

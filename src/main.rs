@@ -10,6 +10,7 @@ use tokio::time::sleep;
 mod hardware;
 mod api;
 mod config;
+mod game_runtime;
 mod service;
 mod error;
 mod setup;
@@ -20,8 +21,12 @@ use config::{LauncherConfig, LauncherSettings, load_config, save_config, delete_
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 #[allow(dead_code)] // usado só no fluxo antigo (wait_for_pairing), ver comentário lá
 const PAIRING_POLL_INTERVAL_SECS: u64 = 10;
-const DEVICE_FLOW_POLL_SECS: u64 = 5;
 const DEVICE_FLOW_RETRY_SECS: u64 = 10;
+const GAME_RESTART_DELAY_SECS: u64 = 3;
+
+/// Único game_type suportado por enquanto (decisão do usuário) — quando
+/// entrar outro jogo, isso vira campo vindo da ilha em vez de constante.
+const GAME_TYPE: &str = "pachinko3";
 
 #[derive(Parser)]
 #[command(name = "pachinko_vlt_launcher")]
@@ -54,9 +59,35 @@ enum Commands {
     UninstallService,
 }
 
+/// Onde os logs do próprio launcher (info!/warn!/error!) ficam gravados —
+/// terminal sozinho não serve porque a TUI (raw mode/alt screen) sobrescreve
+/// tudo, some assim que a tela redesenha.
+const LAUNCHER_LOG_PATH: &str = "/var/log/pachinko-launcher.log";
+/// stdout+stderr do processo do jogo em si (SDL/ALSA/crash) — separado do
+/// log do launcher pra não misturar as duas coisas.
+const GAME_LOG_PATH: &str = "/var/log/pachinko-launcher-game.log";
+
+/// Loga em arquivo além do terminal (quando dá pra abrir o arquivo — se não
+/// der, cai só no terminal mesmo, não trava o launcher por causa de log).
+fn init_logging() {
+    use std::io::Write;
+
+    let file = std::fs::OpenOptions::new().create(true).append(true).open(LAUNCHER_LOG_PATH).ok();
+
+    let mut builder = env_logger::Builder::from_default_env();
+    builder.filter_level(log::LevelFilter::Info);
+    if let Some(file) = file {
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
+        builder.format(|buf, record| {
+            writeln!(buf, "[{}] {} - {}", chrono::Utc::now().to_rfc3339(), record.level(), record.args())
+        });
+    }
+    builder.init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    init_logging();
 
     let cli = Cli::parse();
 
@@ -90,13 +121,19 @@ fn load_runtime_settings() -> LauncherSettings {
         }
     }
     LauncherSettings {
-        cs_url: std::env::var("CS_URL").unwrap_or_else(|_| "http://localhost:8888".to_string()),
+        cs_url: std::env::var("CS_URL").unwrap_or_else(|_| "https://pachinko.espindolasoftware.com.br".to_string()),
         game_path: std::env::var("VLT_GAME_PATH").unwrap_or_else(|_| "./pachinko_game".to_string()),
+        // Mesmo comando já usado em produção noutra máquina (ver .xinitrc de
+        // referência) — só o `--token` virou `GAME_TOKEN` via env.
         game_args: std::env::var("VLT_GAME_ARGS")
-            .unwrap_or_default()
+            .unwrap_or_else(|_| {
+                "-release -- --env=prod --channel web --layout=stacked_dual --button-hub --top-header-font".to_string()
+            })
             .split_whitespace()
             .map(String::from)
             .collect(),
+        game_registry_url: std::env::var("GAME_REGISTRY_URL")
+            .unwrap_or_else(|_| "http://192.168.15.12:8090".to_string()),
     }
 }
 
@@ -119,7 +156,14 @@ async fn run() -> Result<()> {
             Some(cfg) => {
                 match try_get_token_and_run(&cs_url, &cfg, &fingerprint, &config_path, &settings).await {
                     Ok(()) => {
-                        info!("Jogo encerrado. Reiniciando...");
+                        // Sem isso, jogo que crasha na hora (SDL/lib faltando/etc)
+                        // vira loop bem apertado: reinicia sem pausa nenhuma, cada
+                        // ciclo só bate `/launcher` + `/game/latest` de novo — no
+                        // registry parece um retry de rede martelando, mas é o
+                        // jogo caindo repetido (ver `game.log`/stderr do processo
+                        // pra causa raiz de verdade).
+                        warn!("Jogo encerrado. Reiniciando em {}s...", GAME_RESTART_DELAY_SECS);
+                        sleep(Duration::from_secs(GAME_RESTART_DELAY_SECS)).await;
                     }
                     Err(e) if e.to_string().contains("401") || e.to_string().contains("403") => {
                         warn!("Credenciais inválidas ({}). Limpando config e reiniciando device flow.", e);
@@ -134,8 +178,8 @@ async fn run() -> Result<()> {
             }
             None => {
                 // Máquina crua (sem config ainda) — mostra o menu inicial em vez de
-                // ir direto pro registro. "Configurar Máquina" usa o device flow
-                // (autorregistro + código no backoffice), não o pareamento OTP antigo.
+                // ir direto pro registro. "Registrar Máquina" usa o device flow
+                // (código de 4 dígitos + faixa da sala), não o pareamento OTP antigo.
                 match tui::run_menu()? {
                     Some(tui::MenuChoice::ConfigureMachine) => {
                         run_device_flow(&cs_url, &fingerprint, &config_path, &settings).await?;
@@ -173,7 +217,7 @@ async fn try_get_token_and_run(
         heartbeat_loop(&heartbeat_cs_url, &machine_code, &heartbeat_config_path).await;
     });
 
-    let exit_status = spawn_game_and_wait(&token_resp.token, settings)?;
+    let exit_status = spawn_game_and_wait(&token_resp.token, &config.machine_variant, settings).await?;
     info!("Jogo encerrado (status: {}). Reiniciando...", exit_status);
 
     Ok(())
@@ -316,6 +360,10 @@ async fn wait_for_pairing(cs_url: &str, fingerprint: &str, config_path: &PathBuf
                             hardware_fingerprint: fingerprint.to_string(),
                             cs_url: cs_url.to_string(),
                             paired_at: chrono::Utc::now().to_rfc3339(),
+                            // Fluxo antigo (OTP) sempre foi só pra VLT — nunca teve
+                            // conceito de sala/variante, "vlt" é o único valor que
+                            // fazia sentido aqui de qualquer forma.
+                            machine_variant: "vlt".to_string(),
                         };
                         save_config(config_path, &cfg)
                             .context("Falha ao salvar configuração após pareamento")?;
@@ -330,7 +378,7 @@ async fn wait_for_pairing(cs_url: &str, fingerprint: &str, config_path: &PathBuf
                             async move { heartbeat_loop(&cs, &mc, &cp).await; }
                         });
 
-                        let exit_status = spawn_game_and_wait(&resp.token, settings)?;
+                        let exit_status = spawn_game_and_wait(&resp.token, &cfg.machine_variant, settings).await?;
                         info!("Jogo encerrado (status: {}). Reiniciando...", exit_status);
                         return Ok(());
                     }
@@ -363,33 +411,127 @@ fn wait_or_cancel(duration: Duration) -> Result<bool> {
     }
 }
 
-/// Device flow (Etapa 5): launcher autorregistra (só `hardware_fingerprint`,
-/// sem local/sala/ilha — isso só se escolhe no backoffice, na aprovação),
-/// mostra o `user_code` na tela, faz polling até aprovado, salva config e
-/// sobe o jogo. Substitui o pareamento OTP antigo (`wait_for_pairing`) como
-/// o que "Configurar Máquina" chama — o fluxo antigo continua existindo no
-/// servidor, só não é mais chamado por aqui.
+/// Sinaliza a thread de `wait_for_escape` pra parar quando o `select!` que a
+/// chama escolhe o outro branch — sem isso, a `spawn_blocking` continuaria
+/// pollando tecla pra sempre numa thread solta (nunca recebe aviso de
+/// cancelamento sozinha).
+struct EscapeWatcherGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for EscapeWatcherGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Fica escutando Esc indefinidamente, sem prazo — usado em telas de
+/// preparação (download do jogo) onde não dá pra saber quanto tempo vai
+/// levar. `poll_key` é síncrono/bloqueante, roda inteiro numa única
+/// `spawn_blocking` (mesma thread do início ao fim — thread_local do
+/// buttonhub não fica reconectando a cada 200ms).
+async fn wait_for_escape() {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _guard = EscapeWatcherGuard(stop.clone());
+
+    let handle = tokio::task::spawn_blocking(move || {
+        loop {
+            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            if let Ok(Some(KeyCode::Esc)) = tui::poll_key(Duration::from_millis(200)) {
+                return;
+            }
+        }
+    });
+
+    let _ = handle.await;
+}
+
+/// Device flow (Etapa 5, revisado 2026-07-21): sem backoffice, sem
+/// aprovação de admin. Quem instala digita só o código de 4 dígitos da
+/// máquina (faixa numérica pré-atribuída à sala resolve local/sala do lado
+/// do servidor, ver `device_lookup.py`), escolhe a ilha dentre as que já
+/// existem na sala resolvida e digita a posição livre. Ativa na hora.
+/// Rastreio de quem/quando instalou fica pra uma segunda camada de
+/// autenticação futura (decisão do usuário, registrada em
+/// `ROADMAP_LAUNCHER_DEVICE_FLOW.md`).
 async fn run_device_flow(
     cs_url: &str,
     fingerprint: &str,
     config_path: &PathBuf,
     settings: &LauncherSettings,
 ) -> Result<()> {
-    let mut screen = tui::enter_screen()?;
-
     let machine_type = hardware::video::detect_machine_type();
 
-    let registration = loop {
-        match api::register_device(cs_url, fingerprint, machine_type).await {
-            Ok(r) => break r,
+    let Some(machine_code) = tui::enter_digits("Código da máquina", 4)? else {
+        return Ok(());
+    };
+
+    let mut screen = tui::enter_screen()?;
+    let lookup = loop {
+        tui::draw_lines(&mut screen, "Registrar Máquina", &["Consultando código...".to_string()])?;
+        match api::lookup_code(cs_url, &machine_code).await {
+            Ok(l) if l.islands.is_empty() => {
+                tui::draw_lines(
+                    &mut screen,
+                    "Registrar Máquina",
+                    &[
+                        format!("{} / {} não tem ilha cadastrada ainda.", l.location.name, l.room.name),
+                        format!("Tentando de novo em {}s... (Esc cancela)", DEVICE_FLOW_RETRY_SECS),
+                    ],
+                )?;
+                if wait_or_cancel(Duration::from_secs(DEVICE_FLOW_RETRY_SECS))? {
+                    tui::leave_screen(screen)?;
+                    return Ok(());
+                }
+            }
+            Ok(l) => break l,
             Err(e) => {
                 tui::draw_lines(
                     &mut screen,
-                    "Configurar Máquina",
+                    "Registrar Máquina",
                     &[
-                        "Falha ao registrar no servidor:".to_string(),
+                        "Código inválido ou falha ao consultar:".to_string(),
                         e.to_string(),
                         String::new(),
+                        "Esc volta e deixa digitar de novo.".to_string(),
+                    ],
+                )?;
+                if wait_or_cancel(Duration::from_secs(DEVICE_FLOW_RETRY_SECS))? {
+                    tui::leave_screen(screen)?;
+                    return Ok(());
+                }
+            }
+        }
+    };
+    tui::leave_screen(screen)?;
+
+    let island_names: Vec<&str> = lookup.islands.iter().map(|i| i.name.as_str()).collect();
+    let Some(island_idx) = tui::select(
+        &format!("{} / {} — Escolha a ilha", lookup.location.name, lookup.room.name),
+        &island_names,
+    )? else {
+        return Ok(());
+    };
+    let id_island = lookup.islands[island_idx].id.clone();
+    let machine_variant = lookup.machine_variant.clone();
+
+    let Some(position_str) = tui::enter_digits("Posição da máquina na ilha", 2)? else {
+        return Ok(());
+    };
+    let position: u32 = position_str.parse().unwrap_or(0);
+
+    let mut screen = tui::enter_screen()?;
+    let approved = loop {
+        tui::draw_lines(&mut screen, "Registrar Máquina", &["Ativando máquina...".to_string()])?;
+        match api::activate_device(cs_url, &machine_code, fingerprint, machine_type, &id_island, position).await {
+            Ok(resp) => break resp,
+            Err(e) => {
+                tui::draw_lines(
+                    &mut screen,
+                    "Registrar Máquina",
+                    &[
+                        "Falha ao ativar:".to_string(),
+                        e.to_string(),
                         format!("Tentando de novo em {}s... (Esc cancela)", DEVICE_FLOW_RETRY_SECS),
                     ],
                 )?;
@@ -400,67 +542,30 @@ async fn run_device_flow(
             }
         }
     };
-
-    let device_code = registration.device_code;
-    let user_code = registration.user_code;
-
-    let approved = loop {
-        tui::draw_lines(
-            &mut screen,
-            "Configurar Máquina",
-            &[
-                "Digite este código no backoffice para ativar a máquina:".to_string(),
-                String::new(),
-                format!("   {}   ", user_code),
-                String::new(),
-                "Aguardando aprovação do administrador... (Esc cancela)".to_string(),
-            ],
-        )?;
-
-        if wait_or_cancel(Duration::from_secs(DEVICE_FLOW_POLL_SECS))? {
-            tui::leave_screen(screen)?;
-            return Ok(());
-        }
-
-        match api::poll_device_token(cs_url, &device_code).await {
-            Ok(resp) if resp.registration_status == "approved" => break resp,
-            Ok(resp) if resp.registration_status == "expired" => {
-                tui::draw_lines(
-                    &mut screen,
-                    "Configurar Máquina",
-                    &["Código expirado. Registrando de novo...".to_string()],
-                )?;
-                sleep(Duration::from_secs(2)).await;
-                tui::leave_screen(screen)?;
-                return Box::pin(run_device_flow(cs_url, fingerprint, config_path, settings)).await;
-            }
-            Ok(_) => continue, // pending — segue no loop
-            Err(e) => {
-                tui::draw_lines(
-                    &mut screen,
-                    "Configurar Máquina",
-                    &[
-                        format!("Erro ao consultar status: {}", e),
-                        String::new(),
-                        "Tentando de novo... (Esc cancela)".to_string(),
-                    ],
-                )?;
-            }
-        }
-    };
-
     tui::leave_screen(screen)?;
 
+    finish_device_flow(cs_url, fingerprint, config_path, settings, approved, machine_variant).await
+}
+
+async fn finish_device_flow(
+    cs_url: &str,
+    fingerprint: &str,
+    config_path: &PathBuf,
+    settings: &LauncherSettings,
+    approved: api::DeviceActivateResponse,
+    machine_variant: String,
+) -> Result<()> {
     let machine_code = approved
         .machine_code
-        .context("Resposta de aprovação sem machine_code")?;
-    let token = approved.token.context("Resposta de aprovação sem token")?;
+        .context("Resposta de ativação sem machine_code")?;
+    let token = approved.token.context("Resposta de ativação sem token")?;
 
     let cfg = LauncherConfig {
         machine_code: machine_code.clone(),
         hardware_fingerprint: fingerprint.to_string(),
         cs_url: cs_url.to_string(),
         paired_at: chrono::Utc::now().to_rfc3339(),
+        machine_variant,
     };
     save_config(config_path, &cfg).context("Falha ao salvar configuração após aprovação")?;
     info!("Máquina ativada via device flow: {}", machine_code);
@@ -474,7 +579,7 @@ async fn run_device_flow(
         }
     });
 
-    let exit_status = spawn_game_and_wait(&token, settings)?;
+    let exit_status = spawn_game_and_wait(&token, &cfg.machine_variant, settings).await?;
     info!("Jogo encerrado (status: {}). Reiniciando...", exit_status);
 
     Ok(())
@@ -496,17 +601,145 @@ async fn heartbeat_loop(cs_url: &str, machine_code: &str, _config_path: &PathBuf
     }
 }
 
-fn spawn_game_and_wait(token: &str, settings: &LauncherSettings) -> Result<std::process::ExitStatus> {
-    info!("Iniciando jogo: {}", settings.game_path);
+/// Baixa (se preciso) e roda o jogo direto do tmpfs — `machine_variant`
+/// (`vlt`/`street`) vem da sala onde a máquina foi ativada.
+async fn spawn_game_and_wait(
+    token: &str,
+    machine_variant: &str,
+    settings: &LauncherSettings,
+) -> Result<std::process::ExitStatus> {
+    let mut screen = tui::enter_screen()?;
+    let mut last_draw = std::time::Instant::now() - Duration::from_secs(1);
 
-    let status = Command::new(&settings.game_path)
+    let prepare = game_runtime::ensure_game_ready(&settings.game_registry_url, GAME_TYPE, machine_variant, |status| {
+        // Baixa em stream chama isso por chunk — sem throttle a tela pisca
+        // (redesenha centenas de vezes por segundo à toa).
+        let is_final = matches!(status, game_runtime::GameStatus::AlreadyReady { .. });
+        if !is_final && last_draw.elapsed() < Duration::from_millis(200) {
+            return;
+        }
+        last_draw = std::time::Instant::now();
+
+        let lines = match status {
+            game_runtime::GameStatus::CheckingVersion => {
+                vec!["Verificando versão do jogo...".to_string(), "(Esc cancela)".to_string()]
+            }
+            game_runtime::GameStatus::Downloading { downloaded, total } => match total {
+                Some(t) if t > 0 => {
+                    let pct = (downloaded as f64 / t as f64 * 100.0).min(100.0) as u32;
+                    vec![
+                        "Baixando jogo...".to_string(),
+                        format!("{}%  ({} MB / {} MB)", pct, downloaded / 1_000_000, t / 1_000_000),
+                        "(Esc cancela)".to_string(),
+                    ]
+                }
+                _ => vec![
+                    "Baixando jogo...".to_string(),
+                    format!("{} MB", downloaded / 1_000_000),
+                    "(Esc cancela)".to_string(),
+                ],
+            },
+            game_runtime::GameStatus::Extracting => vec!["Descompactando jogo...".to_string()],
+            game_runtime::GameStatus::AlreadyReady { version } => {
+                vec![format!("Versão {} já pronta.", version)]
+            }
+        };
+        let _ = tui::draw_lines(&mut screen, "Preparando Jogo", &lines);
+    });
+
+    // Sem isso, essa tela ficava surda a qualquer tecla — raw mode desliga
+    // até o Ctrl+C virar sinal, então travava de verdade se o registry não
+    // respondesse (só saía matando o processo de outro terminal).
+    let ready = tokio::select! {
+        result = prepare => result.context("Falha ao preparar build do jogo"),
+        _ = wait_for_escape() => {
+            tui::leave_screen(screen)?;
+            anyhow::bail!("Preparação do jogo cancelada pelo operador (Esc)");
+        }
+    };
+
+    let (bin_path, game_dir) = match ready {
+        Ok(paths) => paths,
+        Err(e) => {
+            tui::draw_lines(&mut screen, "Preparando Jogo", &["Falha ao preparar jogo:".to_string(), e.to_string()])?;
+            std::thread::sleep(Duration::from_secs(5));
+            tui::leave_screen(screen)?;
+            return Err(e);
+        }
+    };
+
+    tui::draw_lines(&mut screen, "Preparando Jogo", &["Pronto! Iniciando...".to_string()])?;
+    tui::leave_screen(screen)?;
+
+    info!("Iniciando jogo: {:?} {:?}", bin_path, settings.game_args);
+
+    // Token via env var, não `--token` em argv — argv de qualquer processo
+    // é visível a qualquer usuário local via `ps aux`/`/proc/<pid>/cmdline`,
+    // env var do processo filho não (só root ou o dono do processo leem
+    // `/proc/<pid>/environ`). Fix de segurança já mapeado no roadmap.
+    // Jogo é gráfico (X11) — launcher roda via systemd, não herda DISPLAY de
+    // sessão nenhuma. Usa o DISPLAY do próprio launcher se vier setado
+    // (override), senão cai no padrão da VLT física.
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0.0".to_string());
+
+    // Launcher roda como root (precisa pro tmpfs/dmidecode), mas o X server
+    // normalmente é iniciado por outro usuário — sem XAUTHORITY apontando
+    // pro cookie de quem iniciou o X, root não tem permissão de conectar
+    // (SDL não acha "video device" mesmo com X de pé). Path padrão do Xauth
+    // do usuário `game` (mesmo da sessão gráfica, ver `.xinitrc`).
+    let xauthority = std::env::var("XAUTHORITY").unwrap_or_else(|_| "/home/game/.Xauthority".to_string());
+
+    info!(
+        "Config de execução — bin: {:?} | cwd: {:?} | DISPLAY={} | XAUTHORITY={} (existe: {}) | args: {:?}",
+        bin_path,
+        game_dir,
+        display,
+        xauthority,
+        std::path::Path::new(&xauthority).is_file(),
+        settings.game_args
+    );
+    if let Ok(meta) = std::fs::metadata(&bin_path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            info!("Binário existe, {} bytes, permissões {:o}", meta.len(), meta.permissions().mode() & 0o777);
+        }
+    } else {
+        warn!("Binário {:?} não existe no momento do spawn!", bin_path);
+    }
+
+    // stdout/stderr do jogo iam pro terminal por padrão — mas a TUI
+    // (raw mode/alt screen) cobre isso, então erro de SDL/lib faltando
+    // nunca sobrava pra ler depois. Grava num arquivo fixo (sobrescreve a
+    // cada boot do jogo — só o último run importa pra debug).
+    let game_log = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(GAME_LOG_PATH)
+        .with_context(|| format!("Falha ao abrir {}", GAME_LOG_PATH))?;
+    let game_log_stderr = game_log.try_clone().context("Falha ao duplicar handle do log do jogo")?;
+
+    // O jogo (RuntimeConfig.hx::extractTokenFromArgs) só lê token de
+    // `Sys.args()` — não tem leitura de env var nenhuma hoje. `GAME_TOKEN`
+    // no ambiente fica de bônus (sem uso ainda, caso o jogo ganhe suporte
+    // depois), mas `--token` no argv é o que faz o jogo autenticar de
+    // verdade — sem isso ele roda sem token nenhum, sem dar erro visível.
+    let status = Command::new(&bin_path)
+        .current_dir(&game_dir)
+        .env("GAME_TOKEN", token)
+        .env("DISPLAY", display)
+        .env("XAUTHORITY", xauthority)
         .arg("--token")
         .arg(token)
         .args(&settings.game_args)
+        .stdout(game_log)
+        .stderr(game_log_stderr)
         .spawn()
-        .with_context(|| format!("Falha ao iniciar jogo: {}", settings.game_path))?
+        .with_context(|| format!("Falha ao iniciar jogo: {:?}", bin_path))?
         .wait()
-        .with_context(|| format!("Falha ao aguardar jogo: {}", settings.game_path))?;
+        .with_context(|| format!("Falha ao aguardar jogo: {:?}", bin_path))?;
 
+    info!("Jogo saiu com status {} — log completo em {}", status, GAME_LOG_PATH);
     Ok(status)
 }
