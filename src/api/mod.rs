@@ -76,6 +76,30 @@ pub struct RoomLookup {
     pub machine_variant: String,
 }
 
+/// Comando que o backend manda de carona na resposta do heartbeat —
+/// hoje só `update_launcher` existe. Backend decide quem recebe (1
+/// máquina/ilha/sala/tudo, ver `AdminScheduleLauncherUpdate` no CS);
+/// launcher só obedece o que chegar no seu próprio heartbeat.
+/// `version`/`url`/`sha256` só vêm preenchidos pra `type: "update_launcher"`
+/// — comandos avulsos (`reboot`/`restart_service`) mandam só `type`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HeartbeatCommand {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HeartbeatResponse {
+    #[serde(default)]
+    pub command: Option<HeartbeatCommand>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct DeviceActivateResponse {
     pub status: String,
@@ -272,21 +296,25 @@ pub struct GameLatestResponse {
     pub game_type: String,
     #[allow(dead_code)]
     pub variant: String,
+    #[allow(dead_code)]
+    pub layout: String,
     pub version: String,
     pub sha256: String,
     pub size_bytes: u64,
     pub download_url: String,
 }
 
-/// GET {registry}/game/latest?game_type=X&variant=Y — versão mais recente
-/// publicada, com hash pra conferir depois do download.
-pub async fn get_latest_build(registry_url: &str, game_type: &str, variant: &str) -> Result<GameLatestResponse> {
+/// GET {registry}/game/latest?game_type=X&variant=Y&layout=Z — versão mais
+/// recente publicada, com hash pra conferir depois do download. `layout`
+/// vem de `hardware::video::detect_machine_type()` (`dual_screen` /
+/// `single_screen_vertical`) — cada quantidade de tela tem build própria.
+pub async fn get_latest_build(registry_url: &str, game_type: &str, variant: &str, layout: &str) -> Result<GameLatestResponse> {
     let client = build_client()?;
     let url = format!("{}/game/latest", registry_url);
 
     let resp = client
         .get(&url)
-        .query(&[("game_type", game_type), ("variant", variant)])
+        .query(&[("game_type", game_type), ("variant", variant), ("layout", layout)])
         .send()
         .await
         .with_context(|| format!("Falha ao conectar ao game_registry em {}", url))?;
@@ -297,6 +325,63 @@ pub async fn get_latest_build(registry_url: &str, game_type: &str, variant: &str
     } else {
         let body = resp.text().await.unwrap_or_default();
         anyhow::bail!("get_latest_build HTTP {}: {}", status, body)
+    }
+}
+
+/// POST {cs_url}/machine/game_version_report — reporta a versão do jogo
+/// que rodou. Dois casos: (1) 1º boot pós-pareamento sem pin ainda
+/// (`status="success"`, vira o pin baseline no CS); (2) depois de aplicar
+/// update sob demanda (comando `update_game` do heartbeat). Sem HMAC, mesmo
+/// modelo de confiança do heartbeat/launcher_update_report — best-effort,
+/// não trava o boot se o CS estiver fora do ar.
+pub async fn report_game_version(cs_url: &str, machine_code: &str, version: &str, status: &str) {
+    let client = match build_client() {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Falha ao criar client HTTP pra reportar versão do jogo: {}", e);
+            return;
+        }
+    };
+    let url = format!("{}/machine/game_version_report", cs_url);
+    let body = serde_json::json!({
+        "machine_code": machine_code,
+        "version": version,
+        "status": status,
+    });
+    if let Err(e) = client.post(&url).json(&body).send().await {
+        log::warn!("Falha ao reportar versão do jogo pro backend: {}", e);
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LauncherLatestResponse {
+    pub version: String,
+    pub sha256: String,
+    #[allow(dead_code)]
+    pub size_bytes: u64,
+    pub download_url: String,
+}
+
+/// GET {registry}/launcher/latest — versão mais recente do próprio
+/// launcher publicada. Usado pelo botão "Atualizar Launcher" do menu
+/// (máquina ainda sem pareamento, sem heartbeat pra receber update via
+/// backend — checagem sob demanda, só quando o operador clica).
+pub async fn get_latest_launcher_build(registry_url: &str) -> Result<LauncherLatestResponse> {
+    let client = build_client()?;
+    let url = format!("{}/launcher/latest", registry_url);
+
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("Falha ao conectar ao game_registry em {}", url))?;
+
+    let status = resp.status();
+    if status.is_success() {
+        resp.json::<LauncherLatestResponse>().await.context("Falha ao decodificar resposta de launcher/latest")
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("get_latest_launcher_build HTTP {}: {}", status, body)
     }
 }
 
@@ -340,7 +425,10 @@ pub async fn download_bytes_with_progress(
     Ok(buf)
 }
 
-pub async fn send_heartbeat(cs_url: &str, machine_code: &str) -> Result<()> {
+/// Devolve o comando pendente (se tiver algum) na resposta do heartbeat —
+/// ver `HeartbeatCommand`. Aplicar o comando é responsabilidade de quem
+/// chama, não desse módulo de API.
+pub async fn send_heartbeat(cs_url: &str, machine_code: &str) -> Result<Option<HeartbeatCommand>> {
     let client = build_client()?;
     let url = format!("{}/machine/heartbeat", cs_url);
 
@@ -352,7 +440,8 @@ pub async fn send_heartbeat(cs_url: &str, machine_code: &str) -> Result<()> {
         .with_context(|| format!("Falha ao enviar heartbeat para {}", url))?;
 
     if resp.status().is_success() {
-        Ok(())
+        let body = resp.json::<HeartbeatResponse>().await.context("Falha ao decodificar resposta de heartbeat")?;
+        Ok(body.command)
     } else {
         let code = resp.status().as_u16();
         anyhow::bail!("heartbeat HTTP {}", code)

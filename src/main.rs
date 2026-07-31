@@ -4,8 +4,42 @@ use crossterm::event::KeyCode;
 use log::{info, warn, error};
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::sleep;
+
+/// PID do processo do jogo em execução agora, se houver — permite ao
+/// `heartbeat_loop` (rodando em task separada) matar o jogo sob comando
+/// `update_game` sem precisar guardar o `Child` inteiro (que ficaria preso
+/// no `.wait()` bloqueante de `spawn_game_and_wait`). `kill <pid>` externo
+/// via shell em vez de `Child::kill()` — evita disputa de lock em torno do
+/// `.wait()`.
+type SharedGamePid = Arc<Mutex<Option<u32>>>;
+
+/// Handle da task de `heartbeat_loop` em execução — achado real 28/07: toda
+/// vez que o jogo reinicia (crash-loop), `try_get_token_and_run` subia um
+/// `heartbeat_loop` **novo** sem nunca cancelar o anterior. Numa máquina com
+/// o jogo falhando repetido, isso empilhava dezenas de heartbeats
+/// concorrentes — resultado visto ao vivo: comando batendo a cada poucos
+/// segundos em vez de a cada 30s, disputando rede entre si. Abortar o
+/// anterior antes de subir um novo garante só 1 vivo por vez.
+type SharedHeartbeatHandle = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
+
+fn respawn_heartbeat_loop(
+    handle_slot: &SharedHeartbeatHandle,
+    cs_url: String,
+    machine_code: String,
+    config_path: PathBuf,
+    game_pid: SharedGamePid,
+) {
+    let mut slot = handle_slot.lock().unwrap();
+    if let Some(old) = slot.take() {
+        old.abort();
+    }
+    *slot = Some(tokio::spawn(async move {
+        heartbeat_loop(&cs_url, &machine_code, &config_path, game_pid).await;
+    }));
+}
 
 mod hardware;
 mod api;
@@ -13,8 +47,10 @@ mod config;
 mod game_runtime;
 mod service;
 mod error;
+mod network_selfheal;
 mod setup;
 mod tui;
+mod update;
 
 use config::{LauncherConfig, LauncherSettings, load_config, save_config, delete_config, get_config_path, get_pairing_code_path, get_settings_path, load_settings};
 
@@ -23,6 +59,17 @@ const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const PAIRING_POLL_INTERVAL_SECS: u64 = 10;
 const DEVICE_FLOW_RETRY_SECS: u64 = 10;
 const GAME_RESTART_DELAY_SECS: u64 = 3;
+/// VT (console de texto) onde o launcher roda — `TTYPath` da unit systemd.
+const LAUNCHER_VT: &str = "1";
+/// VT onde o X/jogo roda — ver `.xinitrc`/autologin do usuário `game`.
+const GAME_VT: &str = "2";
+/// X e jogo rodam como root (ver `ensure_x_running`) — display/cookie fixos.
+const X_DISPLAY: &str = ":0";
+const X_AUTHORITY: &str = "/root/.Xauthority";
+/// Resolução por tela do jogo hoje (fixo — quando existir variante 1 tela,
+/// isso deixa de ser constante única, ver comentário em `configure_display_layout`).
+const GAME_SCREEN_MODE: &str = "800x600";
+const SINGLE_SCREEN_MODE: &str = "1920x1080";
 
 /// Único game_type suportado por enquanto (decisão do usuário) — quando
 /// entrar outro jogo, isso vira campo vindo da ilha em vez de constante.
@@ -133,13 +180,20 @@ fn load_runtime_settings() -> LauncherSettings {
             .map(String::from)
             .collect(),
         game_registry_url: std::env::var("GAME_REGISTRY_URL")
-            .unwrap_or_else(|_| "http://192.168.15.12:8090".to_string()),
+            .unwrap_or_else(|_| "https://pachinko.espindolasoftware.com.br:8090".to_string()),
     }
 }
+
+/// Fixo por enquanto (ver BACKLOG.md "Controle de volume via launcher") —
+/// sem configuração remota ainda, só garante volume consistente entre
+/// máquinas na hora.
+const DEFAULT_VOLUME_PERCENT: u8 = 13;
 
 async fn run() -> Result<()> {
     let settings = load_runtime_settings();
     let cs_url = settings.cs_url.clone();
+
+    hardware::audio::set_volume(DEFAULT_VOLUME_PERCENT);
 
     let hw_info = hardware::collect()
         .context("Falha ao coletar informações de hardware")?;
@@ -149,12 +203,21 @@ async fn run() -> Result<()> {
     let config_path = get_config_path()
         .context("Não foi possível determinar caminho de configuração")?;
 
+    // Sem marcador de update pendente, no-op — só age de verdade logo depois
+    // de um `apply_update` ter trocado o symlink (self-check confirma ou
+    // reverte sozinho antes de seguir pro menu/jogo).
+    let machine_code_for_check = load_config(&config_path).ok().map(|c| c.machine_code);
+    update::check_pending_update_or_rollback(&cs_url, machine_code_for_check.as_deref()).await;
+
+    let game_pid: SharedGamePid = Arc::new(Mutex::new(None));
+    let heartbeat_handle: SharedHeartbeatHandle = Arc::new(Mutex::new(None));
+
     loop {
         let config = load_config(&config_path).ok();
 
         match config {
             Some(cfg) => {
-                match try_get_token_and_run(&cs_url, &cfg, &fingerprint, &config_path, &settings).await {
+                match try_get_token_and_run(&cs_url, &cfg, &fingerprint, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone()).await {
                     Ok(()) => {
                         // Sem isso, jogo que crasha na hora (SDL/lib faltando/etc)
                         // vira loop bem apertado: reinicia sem pausa nenhuma, cada
@@ -168,10 +231,16 @@ async fn run() -> Result<()> {
                     Err(e) if e.to_string().contains("401") || e.to_string().contains("403") => {
                         warn!("Credenciais inválidas ({}). Limpando config e reiniciando device flow.", e);
                         delete_config(&config_path);
-                        run_device_flow(&cs_url, &fingerprint, &config_path, &settings).await?;
+                        run_device_flow(&cs_url, &fingerprint, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone()).await?;
                     }
                     Err(e) => {
                         error!("Erro ao obter token: {}. Tentando novamente em {}s...", e, HEARTBEAT_INTERVAL_SECS);
+                        // Erro de conexão (não 401/403, já tratado acima) —
+                        // tenta consertar rede sozinho antes do próximo retry
+                        // (ver network_selfheal.rs pro achado real).
+                        if e.to_string().contains("Falha ao conectar") {
+                            network_selfheal::try_self_heal();
+                        }
                         sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
                     }
                 }
@@ -182,13 +251,35 @@ async fn run() -> Result<()> {
                 // (código de 4 dígitos + faixa da sala), não o pareamento OTP antigo.
                 match tui::run_menu()? {
                     Some(tui::MenuChoice::ConfigureMachine) => {
-                        run_device_flow(&cs_url, &fingerprint, &config_path, &settings).await?;
+                        run_device_flow(&cs_url, &fingerprint, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone()).await?;
                     }
                     Some(tui::MenuChoice::TestMachine) => {
                         run_test_menu_loop().await?;
                     }
+                    Some(tui::MenuChoice::UpdateLauncher) => {
+                        run_update_launcher_from_menu(&settings).await?;
+                    }
+                    Some(tui::MenuChoice::Restart) => {
+                        info!("Reiniciado pelo menu — chamando systemctl reboot.");
+                        // .status() (espera terminar), não .spawn() — achado
+                        // real: com spawn() o launcher retornava Ok(()) e
+                        // morria (exit 0, `Restart=on-failure` não reinicia
+                        // em saída limpa) quase junto, e o systemd
+                        // (KillMode=control-group, padrão) matava o
+                        // `systemctl reboot` no meio do caminho antes dele
+                        // completar — máquina nunca reiniciava de verdade.
+                        // `systemctl reboot` só manda o pedido pro PID1 e
+                        // retorna rápido, não espera o reboot física
+                        // acontecer — `.status()` não trava.
+                        let _ = Command::new("systemctl").arg("reboot").status();
+                        return Ok(());
+                    }
                     Some(tui::MenuChoice::Shutdown) => {
-                        info!("Desligado pelo menu.");
+                        info!("Desligado pelo menu — chamando systemctl poweroff.");
+                        // Mesmo achado do Restart acima — .status() em vez
+                        // de .spawn(), garante que o pedido chegou no PID1
+                        // antes do processo morrer.
+                        let _ = Command::new("systemctl").arg("poweroff").status();
                         return Ok(());
                     }
                     None => {}
@@ -204,22 +295,64 @@ async fn try_get_token_and_run(
     fingerprint: &str,
     config_path: &PathBuf,
     settings: &LauncherSettings,
+    game_pid: SharedGamePid,
+    heartbeat_handle: SharedHeartbeatHandle,
 ) -> Result<()> {
     info!("Obtendo token para máquina {}...", config.machine_code);
     let token_resp = api::get_token(cs_url, &config.machine_code, fingerprint).await?;
 
     info!("Token obtido. Iniciando jogo...");
-    let heartbeat_cs_url = cs_url.to_string();
-    let machine_code = config.machine_code.clone();
-    let heartbeat_config_path = config_path.clone();
+    respawn_heartbeat_loop(
+        &heartbeat_handle,
+        cs_url.to_string(),
+        config.machine_code.clone(),
+        config_path.clone(),
+        game_pid.clone(),
+    );
 
-    tokio::spawn(async move {
-        heartbeat_loop(&heartbeat_cs_url, &machine_code, &heartbeat_config_path).await;
-    });
-
-    let exit_status = spawn_game_and_wait(&token_resp.token, &config.machine_variant, settings).await?;
+    let exit_status = spawn_game_and_wait(&token_resp.token, config, config_path, settings, game_pid).await?;
     info!("Jogo encerrado (status: {}). Reiniciando...", exit_status);
 
+    Ok(())
+}
+
+/// Botão "Atualizar Launcher" do menu — sob demanda, só quando o operador
+/// clica (máquina ainda sem pareamento não tem heartbeat, não recebe
+/// update via backend). Consulta a versão mais recente publicada direto
+/// no registry, reusa a mesma lógica de baixar/conferir/trocar/reiniciar
+/// do update via heartbeat (`update::apply_update`).
+async fn run_update_launcher_from_menu(settings: &LauncherSettings) -> Result<()> {
+    let mut screen = tui::enter_screen()?;
+    tui::draw_lines(&mut screen, "Atualizar Launcher", &["Consultando versão mais recente...".to_string()])?;
+
+    let latest = match api::get_latest_launcher_build(&settings.game_registry_url).await {
+        Ok(latest) => latest,
+        Err(e) => {
+            tui::leave_screen(screen)?;
+            tui::show_placeholder("Atualizar Launcher", &format!("Falha ao consultar registry: {}", e))?;
+            return Ok(());
+        }
+    };
+
+    if latest.version == env!("CARGO_PKG_VERSION") {
+        tui::leave_screen(screen)?;
+        tui::show_placeholder("Atualizar Launcher", &format!("Já está na última versão ({}).", latest.version))?;
+        return Ok(());
+    }
+
+    tui::draw_lines(
+        &mut screen,
+        "Atualizar Launcher",
+        &[format!("Baixando e aplicando versão {}...", latest.version)],
+    )?;
+    if let Err(e) = update::apply_update(&latest.version, &latest.download_url, &latest.sha256).await {
+        tui::leave_screen(screen)?;
+        tui::show_placeholder("Atualizar Launcher", &format!("Falha ao atualizar: {}", e))?;
+        return Ok(());
+    }
+
+    // Deu certo — `apply_update` já disparou `systemctl restart`, que mata
+    // este processo em instantes. Sem mais nada a fazer aqui.
     Ok(())
 }
 
@@ -243,6 +376,18 @@ async fn run_test_menu_loop() -> Result<()> {
     }
 }
 
+/// IPs (v4) de todas as interfaces de rede, via `hostname -I` (já vem no Debian).
+/// ponytail: shell out em vez de lib de rede, uma linha resolve.
+fn local_ips() -> String {
+    match Command::new("hostname").arg("-I").output() {
+        Ok(output) if output.status.success() => {
+            let ips = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if ips.is_empty() { "nenhum".to_string() } else { ips }
+        }
+        _ => "erro ao consultar".to_string(),
+    }
+}
+
 /// Fica pingando (checagem de internet, não é ICMP) em loop até Esc/q.
 /// `check_connection` já tem timeout de 5s — enquanto uma tentativa está
 /// pendurada (rede fora do ar), a tecla de saída só é lida depois que essa
@@ -250,6 +395,7 @@ async fn run_test_menu_loop() -> Result<()> {
 async fn run_connection_test_loop() -> Result<()> {
     let mut screen = tui::enter_screen()?;
     let mut history: Vec<String> = Vec::new();
+    let ips = local_ips();
 
     let result: Result<()> = loop {
         let line = match api::check_connection().await {
@@ -265,7 +411,11 @@ async fn run_connection_test_loop() -> Result<()> {
             history.remove(0);
         }
 
-        let mut lines = vec!["Ping contínuo — Esc para sair".to_string(), String::new()];
+        let mut lines = vec![
+            "Ping contínuo — Esc para sair".to_string(),
+            format!("IP(s): {}", ips),
+            String::new(),
+        ];
         lines.extend(history.iter().cloned());
         if let Err(e) = tui::draw_lines(&mut screen, "Conexão", &lines) {
             break Err(e);
@@ -364,6 +514,8 @@ async fn wait_for_pairing(cs_url: &str, fingerprint: &str, config_path: &PathBuf
                             // conceito de sala/variante, "vlt" é o único valor que
                             // fazia sentido aqui de qualquer forma.
                             machine_variant: "vlt".to_string(),
+                            pinned_game_version: None,
+                            pinned_game_sha256: None,
                         };
                         save_config(config_path, &cfg)
                             .context("Falha ao salvar configuração após pareamento")?;
@@ -371,14 +523,11 @@ async fn wait_for_pairing(cs_url: &str, fingerprint: &str, config_path: &PathBuf
                         let _ = std::env::remove_var("PAIRING_CODE");
                         info!("Máquina pareada: {}", resp.machine_code);
 
-                        tokio::spawn({
-                            let cs = cs_url.to_string();
-                            let mc = resp.machine_code.clone();
-                            let cp = config_path.clone();
-                            async move { heartbeat_loop(&cs, &mc, &cp).await; }
-                        });
+                        let game_pid: SharedGamePid = Arc::new(Mutex::new(None));
+                        let heartbeat_handle: SharedHeartbeatHandle = Arc::new(Mutex::new(None));
+                        respawn_heartbeat_loop(&heartbeat_handle, cs_url.to_string(), resp.machine_code.clone(), config_path.clone(), game_pid.clone());
 
-                        let exit_status = spawn_game_and_wait(&resp.token, &cfg.machine_variant, settings).await?;
+                        let exit_status = spawn_game_and_wait(&resp.token, &cfg, config_path, settings, game_pid).await?;
                         info!("Jogo encerrado (status: {}). Reiniciando...", exit_status);
                         return Ok(());
                     }
@@ -459,6 +608,8 @@ async fn run_device_flow(
     fingerprint: &str,
     config_path: &PathBuf,
     settings: &LauncherSettings,
+    game_pid: SharedGamePid,
+    heartbeat_handle: SharedHeartbeatHandle,
 ) -> Result<()> {
     let machine_type = hardware::video::detect_machine_type();
 
@@ -544,7 +695,7 @@ async fn run_device_flow(
     };
     tui::leave_screen(screen)?;
 
-    finish_device_flow(cs_url, fingerprint, config_path, settings, approved, machine_variant).await
+    finish_device_flow(cs_url, fingerprint, config_path, settings, approved, machine_variant, game_pid, heartbeat_handle).await
 }
 
 async fn finish_device_flow(
@@ -554,6 +705,8 @@ async fn finish_device_flow(
     settings: &LauncherSettings,
     approved: api::DeviceActivateResponse,
     machine_variant: String,
+    game_pid: SharedGamePid,
+    heartbeat_handle: SharedHeartbeatHandle,
 ) -> Result<()> {
     let machine_code = approved
         .machine_code
@@ -566,31 +719,94 @@ async fn finish_device_flow(
         cs_url: cs_url.to_string(),
         paired_at: chrono::Utc::now().to_rfc3339(),
         machine_variant,
+        // Sem pin ainda — 1º boot pós-pareamento busca `/game/latest` como
+        // hoje e reporta a versão resolvida pro CS, que vira o pin baseline
+        // (ver `spawn_game_and_wait`).
+        pinned_game_version: None,
+        pinned_game_sha256: None,
     };
     save_config(config_path, &cfg).context("Falha ao salvar configuração após aprovação")?;
     info!("Máquina ativada via device flow: {}", machine_code);
 
-    tokio::spawn({
-        let cs = cs_url.to_string();
-        let mc = machine_code.clone();
-        let cp = config_path.clone();
-        async move {
-            heartbeat_loop(&cs, &mc, &cp).await;
-        }
-    });
+    respawn_heartbeat_loop(&heartbeat_handle, cs_url.to_string(), machine_code.clone(), config_path.clone(), game_pid.clone());
 
-    let exit_status = spawn_game_and_wait(&token, &cfg.machine_variant, settings).await?;
+    let exit_status = spawn_game_and_wait(&token, &cfg, config_path, settings, game_pid).await?;
     info!("Jogo encerrado (status: {}). Reiniciando...", exit_status);
 
     Ok(())
 }
 
-async fn heartbeat_loop(cs_url: &str, machine_code: &str, _config_path: &PathBuf) {
+async fn heartbeat_loop(cs_url: &str, machine_code: &str, config_path: &PathBuf, game_pid: SharedGamePid) {
     let mut failures = 0u32;
     loop {
         sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
         match api::send_heartbeat(cs_url, machine_code).await {
-            Ok(()) => {
+            Ok(Some(cmd)) if cmd.kind == "update_launcher" => {
+                failures = 0;
+                if cmd.version == env!("CARGO_PKG_VERSION") {
+                    // Já é a versão atual — pendência deveria ter sido limpa
+                    // pelo self-check no boot; loga só pra flagar se não foi.
+                    warn!("Update pendente já é a versão atual ({}), ignorando.", cmd.version);
+                } else {
+                    info!(
+                        "Update de launcher solicitado pelo backend: versão {} ({})",
+                        cmd.version, cmd.url
+                    );
+                    if let Err(e) = update::apply_update(&cmd.version, &cmd.url, &cmd.sha256).await {
+                        error!("Falha ao aplicar update de launcher: {}", e);
+                    }
+                }
+            }
+            Ok(Some(cmd)) if cmd.kind == "reboot" => {
+                failures = 0;
+                warn!("Reboot solicitado pelo backend — desligando a máquina.");
+                // spawn (não status/wait) — o reboot mata este processo no
+                // meio do caminho, esperar o status travaria.
+                let _ = Command::new("systemctl").arg("reboot").spawn();
+            }
+            Ok(Some(cmd)) if cmd.kind == "restart_service" => {
+                failures = 0;
+                warn!("Restart do serviço solicitado pelo backend.");
+                let _ = Command::new("systemctl").args(["restart", update::SERVICE_NAME]).spawn();
+            }
+            Ok(Some(cmd)) if cmd.kind == "update_game" => {
+                failures = 0;
+                info!(
+                    "Update de jogo solicitado pelo backend: versão {} (sha256 {})",
+                    cmd.version, cmd.sha256
+                );
+                // Grava o pin local — próxima chamada de `ensure_game_ready`
+                // (depois que o jogo atual sair) já pega essa versão sozinha,
+                // sem precisar de lógica de restart nova aqui.
+                match load_config(config_path) {
+                    Ok(mut fresh) => {
+                        fresh.pinned_game_version = Some(cmd.version.clone());
+                        fresh.pinned_game_sha256 = Some(cmd.sha256.clone());
+                        if let Err(e) = save_config(config_path, &fresh) {
+                            error!("Falha ao salvar pin de versão do jogo: {}", e);
+                        }
+                    }
+                    Err(e) => error!("Falha ao ler config pra gravar pin de versão do jogo: {}", e),
+                }
+                let pid = *game_pid.lock().unwrap();
+                match pid {
+                    Some(pid) => {
+                        info!("Matando processo do jogo (pid {}) pra aplicar versão nova...", pid);
+                        let _ = Command::new("kill").arg(pid.to_string()).status();
+                    }
+                    None => warn!("update_game recebido mas nenhum jogo rodando agora — aplica no próximo boot."),
+                }
+                // Sem isso, o CS nunca sabe que aplicamos — `pending_game_version`
+                // fica preso pra sempre e é reoferecido em todo heartbeat
+                // seguinte (achado real 28/07: heartbeat martelando a cada poucos
+                // segundos numa máquina, CS reenviando o mesmo comando sem parar).
+                api::report_game_version(cs_url, machine_code, &cmd.version, "success").await;
+            }
+            Ok(Some(cmd)) => {
+                failures = 0;
+                warn!("Heartbeat trouxe comando desconhecido: {:?}", cmd);
+            }
+            Ok(None) => {
                 failures = 0;
             }
             Err(e) => {
@@ -603,15 +819,134 @@ async fn heartbeat_loop(cs_url: &str, machine_code: &str, _config_path: &PathBuf
 
 /// Baixa (se preciso) e roda o jogo direto do tmpfs — `machine_variant`
 /// (`vlt`/`street`) vem da sala onde a máquina foi ativada.
+/// Sobe o X (usuário `game`, ver `.xinitrc`) se ainda não estiver rodando.
+/// Best-effort: se falhar, o spawn do jogo adiante vai falhar de forma
+/// visível no log — não vale travar o launcher por causa disso.
+fn ensure_x_running() {
+    if !std::path::Path::new("/tmp/.X11-unix/X0").exists() {
+        // Roda como root direto (não `runuser -u game`) — achado real: sem
+        // getty/sessão logind ativa na VT2 (desabilitamos o getty de propósito,
+        // ver ensure de tty1/tty2), usuário comum não ganha permissão de abrir
+        // o VT (`xf86OpenConsole: Permission denied`). Root sempre pode.
+        info!("X não está rodando, iniciando...");
+        // `startx` acha `~/.xinitrc` via $HOME — sem isso setado (systemd não
+        // seta HOME pra serviços por padrão), cai no `/etc/X11/xinit/xinitrc`
+        // do sistema, que não acha `.xinitrc` nenhum e abre um xterm de
+        // fallback (achado real: terminal root aparecendo em vez do jogo).
+        let spawned = Command::new("startx")
+            .env("HOME", "/root")
+            .args(["--", &format!("vt{}", GAME_VT), "-nocursor"])
+            .spawn();
+        if let Err(e) = spawned {
+            warn!("Falha ao iniciar X: {}", e);
+            return;
+        }
+        let mut ready = false;
+        for _ in 0..20 {
+            if std::path::Path::new("/tmp/.X11-unix/X0").exists() {
+                info!("X pronto.");
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        if !ready {
+            warn!("X não respondeu em 10s — seguindo mesmo assim.");
+            return;
+        }
+    }
+    configure_display_layout();
+}
+
+/// Detecta saídas conectadas (`xrandr --query`, campo "connected") e monta
+/// o layout físico: hoje o jogo só existe em build `800x600` por tela — 1
+/// saída = single screen, 2+ = a 2ª logo abaixo da 1ª (`--below`), igual o
+/// setup manual testado (`xrandr --output HDMI-2 ... --output DP-2
+/// --below HDMI-2`). Quando existir variante de 1 tela de verdade, a
+/// resolução por contagem de tela deixa de ser fixa — hoje só cobre o caso
+/// dual que já temos.
+fn configure_display_layout() {
+    let output = Command::new("xrandr")
+        .env("DISPLAY", X_DISPLAY)
+        .env("XAUTHORITY", X_AUTHORITY)
+        .arg("--query")
+        .output();
+    let names: Vec<String> = match output {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                (fields.len() >= 2 && fields[1] == "connected").then(|| fields[0].to_string())
+            })
+            .collect(),
+        _ => {
+            warn!("Falha ao consultar xrandr --query pra montar layout de tela");
+            return;
+        }
+    };
+
+    let mut cmd = Command::new("xrandr");
+    cmd.env("DISPLAY", X_DISPLAY).env("XAUTHORITY", X_AUTHORITY);
+    let mode_used;
+    match names.as_slice() {
+        [] => {
+            warn!("Nenhuma saída de vídeo conectada detectada via xrandr");
+            return;
+        }
+        [only] => {
+            // 1 tela = build `single_screen_vertical`, gabinete físico monta
+            // o monitor de lado — precisa girar (achado no `.xinitrc` de
+            // referência do gabinete: `1920x1080 --rotate left`), diferente
+            // do `800x600` sem rotação usado no caso dual.
+            mode_used = SINGLE_SCREEN_MODE;
+            cmd.args(["--output", only, "--mode", mode_used, "--rotate", "left", "--primary"]);
+        }
+        [first, second, ..] => {
+            mode_used = GAME_SCREEN_MODE;
+            cmd.args(["--output", first, "--mode", mode_used, "--primary"]);
+            cmd.args(["--output", second, "--mode", mode_used, "--below", first]);
+        }
+    }
+    match cmd.status() {
+        Ok(s) if s.success() => info!("Layout de tela configurado ({:?}): {:?}", mode_used, names),
+        Ok(s) => warn!("xrandr saiu com status {} configurando {:?}", s, names),
+        Err(e) => warn!("Falha ao rodar xrandr: {}", e),
+    }
+}
+
+/// Args fixos do jogo pra `single_screen_vertical` — achado no `.xinitrc`
+/// de referência do gabinete de 1 tela: sem `--button-hub` (esse gabinete
+/// não tem buttonhub físico), com `--top-header-above-video` a mais.
+/// Diferente do caso dual (`settings.game_args`, configurável via
+/// `VLT_GAME_ARGS`) porque hoje não existe mecanismo de variar isso por
+/// layout — fica hardcoded até esse gabinete ganhar configuração própria.
+const SINGLE_SCREEN_GAME_ARGS: &[&str] =
+    &["--channel", "web", "--layout=stacked_dual", "--top-header-font", "--top-header-above-video"];
+
 async fn spawn_game_and_wait(
     token: &str,
-    machine_variant: &str,
+    cfg: &LauncherConfig,
+    config_path: &PathBuf,
     settings: &LauncherSettings,
+    game_pid: SharedGamePid,
 ) -> Result<std::process::ExitStatus> {
+    let machine_variant = &cfg.machine_variant;
     let mut screen = tui::enter_screen()?;
     let mut last_draw = std::time::Instant::now() - Duration::from_secs(1);
 
-    let prepare = game_runtime::ensure_game_ready(&settings.game_registry_url, GAME_TYPE, machine_variant, |status| {
+    // X precisa estar de pé pro xrandr enxergar as saídas conectadas — sem
+    // isso `detect_machine_type()` não vê nenhuma tela e cai no fallback de
+    // 1 tela sempre, mesmo em máquina dual_screen (achado real: build errada
+    // sendo baixada por causa disso).
+    ensure_x_running();
+    let layout = hardware::video::detect_machine_type();
+    let game_args: Vec<String> = if layout == "single_screen_vertical" {
+        SINGLE_SCREEN_GAME_ARGS.iter().map(|s| s.to_string()).collect()
+    } else {
+        settings.game_args.clone()
+    };
+    let pinned = cfg.pinned_game_version.as_deref().zip(cfg.pinned_game_sha256.as_deref());
+    let prepare = game_runtime::ensure_game_ready(&settings.game_registry_url, GAME_TYPE, machine_variant, layout, pinned, |status| {
         // Baixa em stream chama isso por chunk — sem throttle a tela pisca
         // (redesenha centenas de vezes por segundo à toa).
         let is_final = matches!(status, game_runtime::GameStatus::AlreadyReady { .. });
@@ -658,7 +993,7 @@ async fn spawn_game_and_wait(
         }
     };
 
-    let (bin_path, game_dir) = match ready {
+    let (bin_path, game_dir, resolved_version, resolved_sha256) = match ready {
         Ok(paths) => paths,
         Err(e) => {
             tui::draw_lines(&mut screen, "Preparando Jogo", &["Falha ao preparar jogo:".to_string(), e.to_string()])?;
@@ -668,10 +1003,25 @@ async fn spawn_game_and_wait(
         }
     };
 
+    // 1º boot pós-pareamento sem pin ainda — a versão resolvida via
+    // `/game/latest` vira o pin baseline no CS (e local), daí em diante
+    // toda máquina fica travada numa versão específica em vez de sempre
+    // pegar o que for publicado por último.
+    if cfg.pinned_game_version.is_none() {
+        api::report_game_version(&cfg.cs_url, &cfg.machine_code, &resolved_version, "success").await;
+        if let Ok(mut fresh) = load_config(config_path) {
+            fresh.pinned_game_version = Some(resolved_version.clone());
+            fresh.pinned_game_sha256 = Some(resolved_sha256.clone());
+            if let Err(e) = save_config(config_path, &fresh) {
+                warn!("Falha ao gravar pin local de versão do jogo: {}", e);
+            }
+        }
+    }
+
     tui::draw_lines(&mut screen, "Preparando Jogo", &["Pronto! Iniciando...".to_string()])?;
     tui::leave_screen(screen)?;
 
-    info!("Iniciando jogo: {:?} {:?}", bin_path, settings.game_args);
+    info!("Iniciando jogo: {:?} {:?}", bin_path, game_args);
 
     // Token via env var, não `--token` em argv — argv de qualquer processo
     // é visível a qualquer usuário local via `ps aux`/`/proc/<pid>/cmdline`,
@@ -680,14 +1030,12 @@ async fn spawn_game_and_wait(
     // Jogo é gráfico (X11) — launcher roda via systemd, não herda DISPLAY de
     // sessão nenhuma. Usa o DISPLAY do próprio launcher se vier setado
     // (override), senão cai no padrão da VLT física.
-    let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0.0".to_string());
+    let display = std::env::var("DISPLAY").unwrap_or_else(|_| X_DISPLAY.to_string());
 
-    // Launcher roda como root (precisa pro tmpfs/dmidecode), mas o X server
-    // normalmente é iniciado por outro usuário — sem XAUTHORITY apontando
-    // pro cookie de quem iniciou o X, root não tem permissão de conectar
-    // (SDL não acha "video device" mesmo com X de pé). Path padrão do Xauth
-    // do usuário `game` (mesmo da sessão gráfica, ver `.xinitrc`).
-    let xauthority = std::env::var("XAUTHORITY").unwrap_or_else(|_| "/home/game/.Xauthority".to_string());
+    // X e launcher rodam como root os dois agora (`ensure_x_running` sobe
+    // via `startx` direto, sem trocar de usuário) — cookie fica em
+    // `/root/.Xauthority`, criado pelo próprio `startx`.
+    let xauthority = std::env::var("XAUTHORITY").unwrap_or_else(|_| X_AUTHORITY.to_string());
 
     info!(
         "Config de execução — bin: {:?} | cwd: {:?} | DISPLAY={} | XAUTHORITY={} (existe: {}) | args: {:?}",
@@ -696,7 +1044,7 @@ async fn spawn_game_and_wait(
         display,
         xauthority,
         std::path::Path::new(&xauthority).is_file(),
-        settings.game_args
+        game_args
     );
     if let Ok(meta) = std::fs::metadata(&bin_path) {
         #[cfg(unix)]
@@ -720,26 +1068,41 @@ async fn spawn_game_and_wait(
         .with_context(|| format!("Falha ao abrir {}", GAME_LOG_PATH))?;
     let game_log_stderr = game_log.try_clone().context("Falha ao duplicar handle do log do jogo")?;
 
+    // X já foi garantido lá em cima (antes da detecção de layout) — aqui só
+    // troca de VT pro jogo aparecer. Ensure é idempotente (checa X0 antes de
+    // tentar subir de novo), sem custo repetir a chamada.
+    ensure_x_running();
+    let _ = Command::new("chvt").arg(GAME_VT).status();
+
     // O jogo (RuntimeConfig.hx::extractTokenFromArgs) só lê token de
     // `Sys.args()` — não tem leitura de env var nenhuma hoje. `GAME_TOKEN`
     // no ambiente fica de bônus (sem uso ainda, caso o jogo ganhe suporte
     // depois), mas `--token` no argv é o que faz o jogo autenticar de
     // verdade — sem isso ele roda sem token nenhum, sem dar erro visível.
-    let status = Command::new(&bin_path)
+    let mut child = Command::new(&bin_path)
         .current_dir(&game_dir)
         .env("GAME_TOKEN", token)
         .env("DISPLAY", display)
         .env("XAUTHORITY", xauthority)
         .arg("--token")
         .arg(token)
-        .args(&settings.game_args)
+        .args(&game_args)
         .stdout(game_log)
         .stderr(game_log_stderr)
         .spawn()
-        .with_context(|| format!("Falha ao iniciar jogo: {:?}", bin_path))?
+        .with_context(|| format!("Falha ao iniciar jogo: {:?}", bin_path))?;
+
+    *game_pid.lock().unwrap() = Some(child.id());
+    let status = child
         .wait()
-        .with_context(|| format!("Falha ao aguardar jogo: {:?}", bin_path))?;
+        .with_context(|| format!("Falha ao aguardar jogo: {:?}", bin_path));
+    *game_pid.lock().unwrap() = None;
+    let status = status?;
 
     info!("Jogo saiu com status {} — log completo em {}", status, GAME_LOG_PATH);
+
+    // Jogo fechou (crash ou saída normal) — volta a tela pro menu/launcher.
+    let _ = Command::new("chvt").arg(LAUNCHER_VT).status();
+
     Ok(status)
 }

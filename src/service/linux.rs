@@ -4,6 +4,7 @@ use std::process::Command;
 
 const SERVICE_NAME: &str = "pachinko-launcher";
 const SERVICE_FILE: &str = "/etc/systemd/system/pachinko-launcher.service";
+const BINARY_NAME: &str = "pachinko_vlt_launcher";
 
 pub fn install_service() -> Result<()> {
     if unsafe { libc::getuid() } != 0 {
@@ -13,26 +14,31 @@ pub fn install_service() -> Result<()> {
     let service_content = format!(
         r#"[Unit]
 Description=Pachinko VLT Launcher - Registro e Autenticação de Máquinas
-After=network.target
+After=network.target buttonhub.service
 Wants=network-online.target
+Wants=buttonhub.service
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/{}
 Restart=on-failure
 RestartSec=5
-StandardOutput=journal
+StandardInput=tty
+StandardOutput=tty
 StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVTDisallocate=no
 Environment="CS_URL=https://pachinko.espindolasoftware.com.br"
-Environment="GAME_REGISTRY_URL=http://192.168.15.12:8090"
+Environment="GAME_REGISTRY_URL=https://pachinko.espindolasoftware.com.br:8090"
 Environment="DISPLAY=:0.0"
-Environment="XAUTHORITY=/home/game/.Xauthority"
+Environment="XAUTHORITY=/root/.Xauthority"
 Environment="RUST_LOG=info"
 
 [Install]
 WantedBy=multi-user.target
 "#,
-        SERVICE_NAME
+        BINARY_NAME
     );
 
     fs::write(SERVICE_FILE, service_content)

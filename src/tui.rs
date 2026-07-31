@@ -8,23 +8,44 @@ use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
-use std::cell::OnceCell;
+use std::cell::{Cell, RefCell};
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Não tenta reconectar mais que 1x/s — evita martelar o buttonhub se ele
+/// cair de verdade, mas ainda recupera sozinho (ver comentário abaixo).
+const BUTTONHUB_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 thread_local! {
-    /// Conexão com o buttonhub, aberta uma vez e reusada por todo `poll_key`/
-    /// `select` do processo (sempre chamados da thread principal, síncrona).
-    /// `None` se não conseguiu conectar (ex: rodando fora da VLT, em dev) —
-    /// nesse caso navegação cai só no teclado.
-    static BUTTONHUB: OnceCell<Option<crate::hardware::buttonhub::Connection>> = OnceCell::new();
+    /// Conexão com o buttonhub, reusada por todo `poll_key`/`select` do
+    /// processo (sempre chamados da thread principal, síncrona). `None` se
+    /// não conseguiu conectar ainda (ex: rodando fora da VLT, em dev, ou
+    /// buttonhub.service ainda subindo no boot) — nesse caso navegação cai
+    /// só no teclado. Achado real: isso costumava ser um `OnceCell`, que
+    /// cravava a falha da primeira tentativa pra sempre — se o launcher
+    /// ganhava a corrida de boot contra o buttonhub.service, o menu nunca
+    /// mais respondia a botão nenhum até reiniciar o processo. Agora
+    /// reconecta sozinho.
+    static BUTTONHUB: RefCell<Option<crate::hardware::buttonhub::Connection>> = RefCell::new(None);
+    static BUTTONHUB_LAST_ATTEMPT: Cell<Option<Instant>> = Cell::new(None);
 }
 
 fn with_buttonhub_events<T>(f: impl FnOnce(Option<&std::sync::mpsc::Receiver<String>>) -> T) -> T {
     BUTTONHUB.with(|cell| {
-        let conn = cell.get_or_init(|| {
-            crate::hardware::buttonhub::connect(crate::hardware::buttonhub::DEFAULT_PORT).ok()
-        });
+        let mut conn = cell.borrow_mut();
+        if conn.is_none() {
+            let should_retry = BUTTONHUB_LAST_ATTEMPT.with(|last| {
+                let now = Instant::now();
+                let ready = last.get().map_or(true, |t| now.duration_since(t) >= BUTTONHUB_RETRY_INTERVAL);
+                if ready {
+                    last.set(Some(now));
+                }
+                ready
+            });
+            if should_retry {
+                *conn = crate::hardware::buttonhub::connect(crate::hardware::buttonhub::DEFAULT_PORT).ok();
+            }
+        }
         f(conn.as_ref().map(|c| &c.events))
     })
 }
@@ -45,7 +66,9 @@ fn map_button(line: &str) -> Option<KeyCode> {
 
 pub enum MenuChoice {
     TestMachine,
+    UpdateLauncher,
     ConfigureMachine,
+    Restart,
     Shutdown,
 }
 
@@ -56,7 +79,8 @@ pub enum TestChoice {
     Connection,
 }
 
-const MENU_ITEMS: [&str; 3] = ["Testar Máquina", "Registrar Máquina", "Desligar"];
+const MENU_ITEMS: [&str; 5] =
+    ["Testar Máquina", "Atualizar Launcher", "Registrar Máquina", "Reiniciar", "Desligar"];
 
 const TEST_ITEMS: [&str; 4] = ["Testar Inputs", "Som", "Vídeo", "Conexão"];
 
@@ -213,7 +237,9 @@ pub fn run_menu() -> Result<Option<MenuChoice>> {
     let choice = select(" Pachinko3 ", &MENU_ITEMS)?;
     Ok(choice.map(|i| match i {
         0 => MenuChoice::TestMachine,
-        1 => MenuChoice::ConfigureMachine,
+        1 => MenuChoice::UpdateLauncher,
+        2 => MenuChoice::ConfigureMachine,
+        3 => MenuChoice::Restart,
         _ => MenuChoice::Shutdown,
     }))
 }

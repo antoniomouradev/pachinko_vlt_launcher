@@ -151,22 +151,25 @@ fn get_processor() -> Result<String> {
     anyhow::bail!("Processador não encontrado")
 }
 
+/// Achado real: máquina com 2+ interfaces reais (ex: `eno1` ethernet +
+/// `wlp1s0` wifi) tinha fingerprint mudando **entre boots** — `read_dir`
+/// não garante ordem estável, então "a primeira não-loopback" trocava de
+/// interface aleatoriamente a cada boot, mudando o MAC escolhido e por
+/// tabela o fingerprint inteiro (servidor rejeitava com "hardware
+/// fingerprint mismatch", 401, e o launcher apagava o próprio pareamento
+/// por design — não era bug de disco/filesystem, era isso). Fix: ordena
+/// por nome antes de escolher, sempre a mesma interface na mesma máquina.
 fn get_mac_address() -> Result<String> {
-    // Lê primeira interface não-loopback
-    let interfaces = fs::read_dir("/sys/class/net")
-        .context("Falha ao ler /sys/class/net")?;
+    let mut names: Vec<String> = fs::read_dir("/sys/class/net")
+        .context("Falha ao ler /sys/class/net")?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name != "lo")
+        .collect();
+    names.sort();
 
-    for entry in interfaces {
-        let entry = entry.context("Falha ao ler entrada")?;
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        // Ignora loopback
-        if name_str == "lo" {
-            continue;
-        }
-
-        let addr_path = entry.path().join("address");
+    for name in names {
+        let addr_path = format!("/sys/class/net/{}/address", name);
         if let Ok(mac) = fs::read_to_string(&addr_path) {
             let mac = mac.trim();
             if !mac.is_empty() && mac != "00:00:00:00:00:00" {

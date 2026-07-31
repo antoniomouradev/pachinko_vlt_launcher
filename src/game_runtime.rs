@@ -79,15 +79,25 @@ fn ensure_tmpfs_mounted() -> Result<()> {
 }
 
 /// Garante que o binário do jogo está pronto em tmpfs, baixando+extraindo
-/// só se necessário. Retorna `(caminho_do_binário, diretório_base)` — os
-/// assets do jogo são relativos ao diretório base, precisa rodar com esse
-/// `cwd`.
+/// só se necessário. Retorna `(caminho_do_binário, diretório_base,
+/// versão_resolvida, sha256_resolvido)` — os assets do jogo são relativos
+/// ao diretório base, precisa rodar com esse `cwd`. Versão/sha256
+/// resolvidos são o que efetivamente rodou (pin ou latest), pra quem chama
+/// decidir se precisa reportar pro CS/gravar como pin local.
+///
+/// `pinned`: `Some((version, sha256))` = máquina já tem versão travada
+/// pelo backend, baixa exatamente essa via `/game/download/.../{version}`
+/// (sem round-trip JSON, endpoint já serve os bytes crus). `None` = ainda
+/// sem pin (config antigo ou 1º boot pós-pareamento) — mantém o
+/// comportamento antigo, `/game/latest`.
 pub async fn ensure_game_ready(
     registry_url: &str,
     game_type: &str,
     variant: &str,
+    layout: &str,
+    pinned: Option<(&str, &str)>,
     mut on_status: impl FnMut(GameStatus),
-) -> Result<(PathBuf, PathBuf)> {
+) -> Result<(PathBuf, PathBuf, String, String)> {
     ensure_tmpfs_mounted()?;
 
     let bin_name = binary_name(game_type)?;
@@ -95,30 +105,41 @@ pub async fn ensure_game_ready(
     let marker_path = game_dir.join(".installed.json");
 
     on_status(GameStatus::CheckingVersion);
-    let latest = api::get_latest_build(registry_url, game_type, variant)
-        .await
-        .context("Falha ao consultar game_registry_service")?;
+
+    let (version, expected_sha256, download_url, size_bytes) = if let Some((pin_version, pin_sha256)) = pinned {
+        let url = format!(
+            "{}/game/download/{}/{}/{}/{}",
+            registry_url, game_type, variant, layout, pin_version
+        );
+        (pin_version.to_string(), pin_sha256.to_string(), url, None)
+    } else {
+        let latest = api::get_latest_build(registry_url, game_type, variant, layout)
+            .await
+            .context("Falha ao consultar game_registry_service")?;
+        (latest.version, latest.sha256, latest.download_url, Some(latest.size_bytes))
+    };
 
     let already_installed = fs::read_to_string(&marker_path)
         .ok()
         .and_then(|s| serde_json::from_str::<InstalledMarker>(&s).ok())
-        .map(|m| m.sha256 == latest.sha256)
+        .map(|m| m.sha256 == expected_sha256)
         .unwrap_or(false);
 
     if already_installed {
         info!(
             "Build {}/{} v{} já em tmpfs (hash confere) — pulando download",
-            game_type, variant, latest.version
+            game_type, variant, version
         );
-        on_status(GameStatus::AlreadyReady { version: &latest.version });
-        return Ok((game_dir.join(bin_name), game_dir));
+        on_status(GameStatus::AlreadyReady { version: &version });
+        return Ok((game_dir.join(bin_name), game_dir, version, expected_sha256));
     }
 
     info!(
         "Baixando build {}/{} v{} ({} bytes)...",
-        game_type, variant, latest.version, latest.size_bytes
+        game_type, variant, version,
+        size_bytes.map(|b| b.to_string()).unwrap_or_else(|| "?".to_string())
     );
-    let bytes = api::download_bytes_with_progress(&latest.download_url, |downloaded, total| {
+    let bytes = api::download_bytes_with_progress(&download_url, |downloaded, total| {
         on_status(GameStatus::Downloading { downloaded, total });
     })
     .await
@@ -132,10 +153,10 @@ pub async fn ensure_game_ready(
         hasher.update(&bytes);
         format!("{:x}", hasher.finalize())
     };
-    if actual_sha256 != latest.sha256 {
+    if actual_sha256 != expected_sha256 {
         anyhow::bail!(
             "hash não confere pra {}/{} v{} (esperado {}, obtido {}) — build corrompida ou download incompleto",
-            game_type, variant, latest.version, latest.sha256, actual_sha256
+            game_type, variant, version, expected_sha256, actual_sha256
         );
     }
 
@@ -204,13 +225,13 @@ pub async fn ensure_game_ready(
 
     fs::write(
         &marker_path,
-        serde_json::to_string(&InstalledMarker { sha256: latest.sha256.clone(), version: latest.version.clone() })
+        serde_json::to_string(&InstalledMarker { sha256: expected_sha256.clone(), version: version.clone() })
             .context("Falha ao serializar marcador de instalação")?,
     )
     .context("Falha ao escrever marcador de instalação")?;
 
-    info!("Build {}/{} v{} pronta em {:?}", game_type, variant, latest.version, game_dir);
-    Ok((bin_path, game_dir))
+    info!("Build {}/{} v{} pronta em {:?}", game_type, variant, version, game_dir);
+    Ok((bin_path, game_dir, version, expected_sha256))
 }
 
 #[cfg(test)]

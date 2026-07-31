@@ -1,9 +1,35 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::f32::consts::PI;
+use std::process::Command;
 use std::time::Duration;
 
 const TEST_TONE_HZ: f32 = 440.0;
+
+/// Seta o volume — hoje fixo, sem configuração por máquina/backend ainda
+/// (ver BACKLOG.md "Controle de volume via launcher"). Achado real: a
+/// máquina tem 2 cartões de som (`cat /proc/asound/cards`) — card 0 é o
+/// mesmo controlador USB do painel de botões (CSCTEK, "USB Audio and
+/// HID") e é ele que fala com a saída P2 física; card 1 (`HDA Intel PCH`)
+/// só tem saídas HDMI, sem relação com o áudio real dessa máquina. Tentar
+/// mexer no PulseAudio (sink HDMI) ou no ALSA "Master" (card default,
+/// também HDMI) não tinha efeito nenhum — o controle certo é `PCM` no
+/// card 0 especificamente (`amixer -c 0 sset PCM`). Best-effort: loga e
+/// segue se o card/controle não existir nessa máquina, não trava o boot.
+pub fn set_volume(percent: u8) {
+    match Command::new("amixer")
+        .args(["-c", "0", "sset", "PCM", &format!("{}%", percent)])
+        .output()
+    {
+        Ok(o) if o.status.success() => log::info!("Volume setado pra {}%.", percent),
+        Ok(o) => log::warn!(
+            "amixer saiu com status {} setando volume: {}",
+            o.status,
+            String::from_utf8_lossy(&o.stderr)
+        ),
+        Err(e) => log::warn!("Falha ao rodar amixer pra setar volume: {}", e),
+    }
+}
 
 pub fn list_output_devices() -> Result<Vec<String>> {
     let host = cpal::default_host();

@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn default_game_registry_url() -> String {
-    "http://192.168.15.12:8090".to_string()
+    "https://pachinko.espindolasoftware.com.br:8090".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +34,16 @@ pub struct LauncherConfig {
     /// Default `vlt` pra configs salvos antes desse campo existir.
     #[serde(default = "default_machine_variant")]
     pub machine_variant: String,
+    /// Versão do jogo travada pro backend (CS). `None` = máquina ainda sem
+    /// pin (config salvo antes desse campo existir, ou 1º boot em
+    /// andamento) — nesse caso `ensure_game_ready` cai no fluxo antigo
+    /// (`/game/latest`) e reporta a versão resolvida de volta pro CS, que
+    /// vira o pin baseline. Atualizado também quando o heartbeat entrega
+    /// comando `update_game`.
+    #[serde(default)]
+    pub pinned_game_version: Option<String>,
+    #[serde(default)]
+    pub pinned_game_sha256: Option<String>,
 }
 
 pub fn get_config_path() -> Result<PathBuf> {
