@@ -129,6 +129,7 @@ struct DeviceActivateRequest<'a> {
     machine_type: &'a str,
     id_island: &'a str,
     position: u32,
+    ip_addresses: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -141,11 +142,13 @@ struct PairRequest<'a> {
 struct LauncherRequest<'a> {
     machine_code: &'a str,
     hardware_fingerprint: &'a str,
+    ip_addresses: &'a str,
 }
 
 #[derive(Debug, Serialize)]
 struct HeartbeatRequest<'a> {
     machine_code: &'a str,
+    ip_addresses: &'a str,
 }
 
 fn build_client() -> Result<reqwest::Client> {
@@ -153,6 +156,21 @@ fn build_client() -> Result<reqwest::Client> {
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .context("Falha ao criar cliente HTTP")
+}
+
+/// IPs (v4) de todas as interfaces de rede, via `hostname -I` (já vem no
+/// Debian) — inclui LAN, wifi, e o que mais tiver (tailscale etc), espaço
+/// separado. Backend guarda como veio, sem parsear.
+/// ponytail: shell out em vez de lib de rede, uma linha resolve.
+pub fn local_ips() -> String {
+    std::process::Command::new("hostname")
+        .arg("-I")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_default()
 }
 
 /// Fluxo antigo (pareamento OTP) — ver nota em `main.rs::wait_for_pairing`.
@@ -183,7 +201,7 @@ pub async fn get_token(cs_url: &str, machine_code: &str, fingerprint: &str) -> R
 
     let resp = client
         .post(&url)
-        .json(&LauncherRequest { machine_code, hardware_fingerprint: fingerprint })
+        .json(&LauncherRequest { machine_code, hardware_fingerprint: fingerprint, ip_addresses: &local_ips() })
         .send()
         .await
         .with_context(|| format!("Falha ao conectar ao CS em {}", url))?;
@@ -277,6 +295,7 @@ pub async fn activate_device(
             machine_type,
             id_island,
             position,
+            ip_addresses: &local_ips(),
         })
         .send()
         .await
@@ -434,7 +453,7 @@ pub async fn send_heartbeat(cs_url: &str, machine_code: &str) -> Result<Option<H
 
     let resp = client
         .post(&url)
-        .json(&HeartbeatRequest { machine_code })
+        .json(&HeartbeatRequest { machine_code, ip_addresses: &local_ips() })
         .send()
         .await
         .with_context(|| format!("Falha ao enviar heartbeat para {}", url))?;

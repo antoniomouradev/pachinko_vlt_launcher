@@ -376,18 +376,6 @@ async fn run_test_menu_loop() -> Result<()> {
     }
 }
 
-/// IPs (v4) de todas as interfaces de rede, via `hostname -I` (já vem no Debian).
-/// ponytail: shell out em vez de lib de rede, uma linha resolve.
-fn local_ips() -> String {
-    match Command::new("hostname").arg("-I").output() {
-        Ok(output) if output.status.success() => {
-            let ips = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if ips.is_empty() { "nenhum".to_string() } else { ips }
-        }
-        _ => "erro ao consultar".to_string(),
-    }
-}
-
 /// Fica pingando (checagem de internet, não é ICMP) em loop até Esc/q.
 /// `check_connection` já tem timeout de 5s — enquanto uma tentativa está
 /// pendurada (rede fora do ar), a tecla de saída só é lida depois que essa
@@ -395,7 +383,10 @@ fn local_ips() -> String {
 async fn run_connection_test_loop() -> Result<()> {
     let mut screen = tui::enter_screen()?;
     let mut history: Vec<String> = Vec::new();
-    let ips = local_ips();
+    let ips = {
+        let s = api::local_ips();
+        if s.is_empty() { "nenhum".to_string() } else { s }
+    };
 
     let result: Result<()> = loop {
         let line = match api::check_connection().await {
