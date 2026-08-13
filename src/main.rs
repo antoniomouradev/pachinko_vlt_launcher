@@ -31,13 +31,14 @@ fn respawn_heartbeat_loop(
     machine_code: String,
     config_path: PathBuf,
     game_pid: SharedGamePid,
+    event_buffer: status_listener::SharedEventBuffer,
 ) {
     let mut slot = handle_slot.lock().unwrap();
     if let Some(old) = slot.take() {
         old.abort();
     }
     *slot = Some(tokio::spawn(async move {
-        heartbeat_loop(&cs_url, &machine_code, &config_path, game_pid).await;
+        heartbeat_loop(&cs_url, &machine_code, &config_path, game_pid, event_buffer).await;
     }));
 }
 
@@ -49,6 +50,7 @@ mod service;
 mod error;
 mod network_selfheal;
 mod setup;
+mod status_listener;
 mod tui;
 mod update;
 
@@ -212,12 +214,15 @@ async fn run() -> Result<()> {
     let game_pid: SharedGamePid = Arc::new(Mutex::new(None));
     let heartbeat_handle: SharedHeartbeatHandle = Arc::new(Mutex::new(None));
 
+    let event_buffer: status_listener::SharedEventBuffer = Arc::new(Mutex::new(Vec::new()));
+    tokio::spawn(status_listener::run(event_buffer.clone(), status_listener::DEFAULT_PORT));
+
     loop {
         let config = load_config(&config_path).ok();
 
         match config {
             Some(cfg) => {
-                match try_get_token_and_run(&cs_url, &cfg, &fingerprint, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone()).await {
+                match try_get_token_and_run(&cs_url, &cfg, &fingerprint, &hw_info, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone(), event_buffer.clone()).await {
                     Ok(()) => {
                         // Sem isso, jogo que crasha na hora (SDL/lib faltando/etc)
                         // vira loop bem apertado: reinicia sem pausa nenhuma, cada
@@ -231,7 +236,7 @@ async fn run() -> Result<()> {
                     Err(e) if e.to_string().contains("401") || e.to_string().contains("403") => {
                         warn!("Credenciais inválidas ({}). Limpando config e reiniciando device flow.", e);
                         delete_config(&config_path);
-                        run_device_flow(&cs_url, &fingerprint, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone()).await?;
+                        run_device_flow(&cs_url, &fingerprint, &hw_info, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone(), event_buffer.clone()).await?;
                     }
                     Err(e) => {
                         error!("Erro ao obter token: {}. Tentando novamente em {}s...", e, HEARTBEAT_INTERVAL_SECS);
@@ -251,7 +256,7 @@ async fn run() -> Result<()> {
                 // (código de 4 dígitos + faixa da sala), não o pareamento OTP antigo.
                 match tui::run_menu()? {
                     Some(tui::MenuChoice::ConfigureMachine) => {
-                        run_device_flow(&cs_url, &fingerprint, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone()).await?;
+                        run_device_flow(&cs_url, &fingerprint, &hw_info, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone(), event_buffer.clone()).await?;
                     }
                     Some(tui::MenuChoice::TestMachine) => {
                         run_test_menu_loop().await?;
@@ -293,13 +298,15 @@ async fn try_get_token_and_run(
     cs_url: &str,
     config: &LauncherConfig,
     fingerprint: &str,
+    hw_info: &hardware::HardwareInfo,
     config_path: &PathBuf,
     settings: &LauncherSettings,
     game_pid: SharedGamePid,
     heartbeat_handle: SharedHeartbeatHandle,
+    event_buffer: status_listener::SharedEventBuffer,
 ) -> Result<()> {
     info!("Obtendo token para máquina {}...", config.machine_code);
-    let token_resp = api::get_token(cs_url, &config.machine_code, fingerprint).await?;
+    let token_resp = api::get_token(cs_url, &config.machine_code, fingerprint, hw_info).await?;
 
     info!("Token obtido. Iniciando jogo...");
     respawn_heartbeat_loop(
@@ -308,6 +315,7 @@ async fn try_get_token_and_run(
         config.machine_code.clone(),
         config_path.clone(),
         game_pid.clone(),
+        event_buffer,
     );
 
     let exit_status = spawn_game_and_wait(&token_resp.token, config, config_path, settings, game_pid).await?;
@@ -516,7 +524,8 @@ async fn wait_for_pairing(cs_url: &str, fingerprint: &str, config_path: &PathBuf
 
                         let game_pid: SharedGamePid = Arc::new(Mutex::new(None));
                         let heartbeat_handle: SharedHeartbeatHandle = Arc::new(Mutex::new(None));
-                        respawn_heartbeat_loop(&heartbeat_handle, cs_url.to_string(), resp.machine_code.clone(), config_path.clone(), game_pid.clone());
+                        let event_buffer: status_listener::SharedEventBuffer = Arc::new(Mutex::new(Vec::new()));
+                        respawn_heartbeat_loop(&heartbeat_handle, cs_url.to_string(), resp.machine_code.clone(), config_path.clone(), game_pid.clone(), event_buffer);
 
                         let exit_status = spawn_game_and_wait(&resp.token, &cfg, config_path, settings, game_pid).await?;
                         info!("Jogo encerrado (status: {}). Reiniciando...", exit_status);
@@ -597,10 +606,12 @@ async fn wait_for_escape() {
 async fn run_device_flow(
     cs_url: &str,
     fingerprint: &str,
+    hw_info: &hardware::HardwareInfo,
     config_path: &PathBuf,
     settings: &LauncherSettings,
     game_pid: SharedGamePid,
     heartbeat_handle: SharedHeartbeatHandle,
+    event_buffer: status_listener::SharedEventBuffer,
 ) -> Result<()> {
     let machine_type = hardware::video::detect_machine_type();
 
@@ -665,7 +676,7 @@ async fn run_device_flow(
     let mut screen = tui::enter_screen()?;
     let approved = loop {
         tui::draw_lines(&mut screen, "Registrar Máquina", &["Ativando máquina...".to_string()])?;
-        match api::activate_device(cs_url, &machine_code, fingerprint, machine_type, &id_island, position).await {
+        match api::activate_device(cs_url, &machine_code, fingerprint, machine_type, &id_island, position, hw_info).await {
             Ok(resp) => break resp,
             Err(e) => {
                 tui::draw_lines(
@@ -686,7 +697,7 @@ async fn run_device_flow(
     };
     tui::leave_screen(screen)?;
 
-    finish_device_flow(cs_url, fingerprint, config_path, settings, approved, machine_variant, game_pid, heartbeat_handle).await
+    finish_device_flow(cs_url, fingerprint, config_path, settings, approved, machine_variant, game_pid, heartbeat_handle, event_buffer).await
 }
 
 async fn finish_device_flow(
@@ -698,6 +709,7 @@ async fn finish_device_flow(
     machine_variant: String,
     game_pid: SharedGamePid,
     heartbeat_handle: SharedHeartbeatHandle,
+    event_buffer: status_listener::SharedEventBuffer,
 ) -> Result<()> {
     let machine_code = approved
         .machine_code
@@ -719,7 +731,7 @@ async fn finish_device_flow(
     save_config(config_path, &cfg).context("Falha ao salvar configuração após aprovação")?;
     info!("Máquina ativada via device flow: {}", machine_code);
 
-    respawn_heartbeat_loop(&heartbeat_handle, cs_url.to_string(), machine_code.clone(), config_path.clone(), game_pid.clone());
+    respawn_heartbeat_loop(&heartbeat_handle, cs_url.to_string(), machine_code.clone(), config_path.clone(), game_pid.clone(), event_buffer);
 
     let exit_status = spawn_game_and_wait(&token, &cfg, config_path, settings, game_pid).await?;
     info!("Jogo encerrado (status: {}). Reiniciando...", exit_status);
@@ -727,11 +739,18 @@ async fn finish_device_flow(
     Ok(())
 }
 
-async fn heartbeat_loop(cs_url: &str, machine_code: &str, config_path: &PathBuf, game_pid: SharedGamePid) {
+async fn heartbeat_loop(
+    cs_url: &str,
+    machine_code: &str,
+    config_path: &PathBuf,
+    game_pid: SharedGamePid,
+    event_buffer: status_listener::SharedEventBuffer,
+) {
     let mut failures = 0u32;
     loop {
         sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
-        match api::send_heartbeat(cs_url, machine_code).await {
+        let events = status_listener::drain(&event_buffer);
+        match api::send_heartbeat(cs_url, machine_code, &events).await {
             Ok(Some(cmd)) if cmd.kind == "update_launcher" => {
                 failures = 0;
                 if cmd.version == env!("CARGO_PKG_VERSION") {

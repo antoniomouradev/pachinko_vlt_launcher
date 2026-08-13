@@ -130,6 +130,15 @@ struct DeviceActivateRequest<'a> {
     id_island: &'a str,
     position: u32,
     ip_addresses: &'a str,
+    // Componentes crus do fingerprint (ver `hardware::compute_fingerprint`) —
+    // o hash combinado já vai em `hardware_fingerprint` acima; esses campos
+    // são só pra auditoria (CS guarda de forma idempotente, não sobrescreve
+    // se já tiver salvo — ver plano/backlog).
+    bios_uuid: &'a str,
+    baseboard_serial: &'a str,
+    cpu_id: &'a str,
+    disk_serials: &'a str,
+    mac_address: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,12 +152,28 @@ struct LauncherRequest<'a> {
     machine_code: &'a str,
     hardware_fingerprint: &'a str,
     ip_addresses: &'a str,
+    // Mesma ideia do device/activate — máquina já pareada antes dessa
+    // feature existir nunca passa pelo device flow de novo, então manda
+    // os componentes aqui também. CS grava só se ainda não tiver (COALESCE),
+    // uma vez só, sem re-pareamento.
+    bios_uuid: &'a str,
+    baseboard_serial: &'a str,
+    cpu_id: &'a str,
+    disk_serials: &'a str,
+    mac_address: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct GameEvent<'a> {
+    code: &'a str,
+    occurred_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Serialize)]
 struct HeartbeatRequest<'a> {
     machine_code: &'a str,
     ip_addresses: &'a str,
+    events: Vec<GameEvent<'a>>,
 }
 
 fn build_client() -> Result<reqwest::Client> {
@@ -195,13 +220,23 @@ pub async fn pair_machine(cs_url: &str, pairing_code: &str, fingerprint: &str) -
     }
 }
 
-pub async fn get_token(cs_url: &str, machine_code: &str, fingerprint: &str) -> Result<TokenResponse> {
+pub async fn get_token(cs_url: &str, machine_code: &str, fingerprint: &str, hw: &crate::hardware::HardwareInfo) -> Result<TokenResponse> {
     let client = build_client()?;
     let url = format!("{}/launcher", cs_url);
+    let disk_serials = hw.disk_serials.join(",");
 
     let resp = client
         .post(&url)
-        .json(&LauncherRequest { machine_code, hardware_fingerprint: fingerprint, ip_addresses: &local_ips() })
+        .json(&LauncherRequest {
+            machine_code,
+            hardware_fingerprint: fingerprint,
+            ip_addresses: &local_ips(),
+            bios_uuid: &hw.bios_uuid,
+            baseboard_serial: &hw.baseboard_serial,
+            cpu_id: &hw.cpu_id,
+            disk_serials: &disk_serials,
+            mac_address: &hw.mac_address,
+        })
         .send()
         .await
         .with_context(|| format!("Falha ao conectar ao CS em {}", url))?;
@@ -283,9 +318,11 @@ pub async fn activate_device(
     machine_type: &str,
     id_island: &str,
     position: u32,
+    hw: &crate::hardware::HardwareInfo,
 ) -> Result<DeviceActivateResponse> {
     let client = build_client()?;
     let url = format!("{}/device/activate", cs_url);
+    let disk_serials = hw.disk_serials.join(",");
 
     let resp = client
         .post(&url)
@@ -296,6 +333,11 @@ pub async fn activate_device(
             id_island,
             position,
             ip_addresses: &local_ips(),
+            bios_uuid: &hw.bios_uuid,
+            baseboard_serial: &hw.baseboard_serial,
+            cpu_id: &hw.cpu_id,
+            disk_serials: &disk_serials,
+            mac_address: &hw.mac_address,
         })
         .send()
         .await
@@ -447,13 +489,22 @@ pub async fn download_bytes_with_progress(
 /// Devolve o comando pendente (se tiver algum) na resposta do heartbeat —
 /// ver `HeartbeatCommand`. Aplicar o comando é responsabilidade de quem
 /// chama, não desse módulo de API.
-pub async fn send_heartbeat(cs_url: &str, machine_code: &str) -> Result<Option<HeartbeatCommand>> {
+pub async fn send_heartbeat(
+    cs_url: &str,
+    machine_code: &str,
+    events: &[(String, chrono::DateTime<chrono::Utc>)],
+) -> Result<Option<HeartbeatCommand>> {
     let client = build_client()?;
     let url = format!("{}/machine/heartbeat", cs_url);
 
+    let events = events
+        .iter()
+        .map(|(code, occurred_at)| GameEvent { code, occurred_at: *occurred_at })
+        .collect();
+
     let resp = client
         .post(&url)
-        .json(&HeartbeatRequest { machine_code, ip_addresses: &local_ips() })
+        .json(&HeartbeatRequest { machine_code, ip_addresses: &local_ips(), events })
         .send()
         .await
         .with_context(|| format!("Falha ao enviar heartbeat para {}", url))?;
@@ -521,7 +572,17 @@ mod device_flow_tests {
             .create_async()
             .await;
 
-        let resp = activate_device(&server.url(), "8005", "fp-teste", "dual_screen", "I1", 3)
+        let hw = crate::hardware::HardwareInfo {
+            mac_address: "aa:bb".to_string(),
+            bios_uuid: "uuid-1".to_string(),
+            baseboard_serial: "board-1".to_string(),
+            cpu_id: "cpu-1".to_string(),
+            disk_serials: vec!["disk-1".to_string()],
+            processor: "test-cpu".to_string(),
+            hostname: "test-host".to_string(),
+            serial_number: None,
+        };
+        let resp = activate_device(&server.url(), "8005", "fp-teste", "dual_screen", "I1", 3, &hw)
             .await
             .unwrap();
         assert_eq!(resp.machine_code.as_deref(), Some("8005"));
@@ -538,7 +599,17 @@ mod device_flow_tests {
             .create_async()
             .await;
 
-        let result = activate_device(&server.url(), "8005", "fp-outra", "dual_screen", "I1", 1).await;
+        let hw = crate::hardware::HardwareInfo {
+            mac_address: "aa:bb".to_string(),
+            bios_uuid: "uuid-1".to_string(),
+            baseboard_serial: "board-1".to_string(),
+            cpu_id: "cpu-1".to_string(),
+            disk_serials: vec!["disk-1".to_string()],
+            processor: "test-cpu".to_string(),
+            hostname: "test-host".to_string(),
+            serial_number: None,
+        };
+        let result = activate_device(&server.url(), "8005", "fp-outra", "dual_screen", "I1", 1, &hw).await;
         assert!(result.is_err());
     }
 }
