@@ -173,6 +173,17 @@ struct GameEvent<'a> {
 struct HeartbeatRequest<'a> {
     machine_code: &'a str,
     ip_addresses: &'a str,
+    // Só o código de 5 dígitos mais recente (ligado/crédito/atividade/
+    // detalhe/ação) — snapshot "agora", pro CS atualizar `machine.game_state`.
+    // Histórico completo de transições vai por canal separado, mais lento
+    // (ver `send_game_events_batch`), não aqui.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    game_state: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct GameEventsRequest<'a> {
+    machine_code: &'a str,
     events: Vec<GameEvent<'a>>,
 }
 
@@ -488,23 +499,20 @@ pub async fn download_bytes_with_progress(
 
 /// Devolve o comando pendente (se tiver algum) na resposta do heartbeat —
 /// ver `HeartbeatCommand`. Aplicar o comando é responsabilidade de quem
-/// chama, não desse módulo de API.
+/// chama, não desse módulo de API. `game_state`: último código de 5 dígitos
+/// (peek não-destrutivo do `status_listener`, ver `main.rs`) — `None` se o
+/// jogo nunca reportou nada ainda nessa sessão.
 pub async fn send_heartbeat(
     cs_url: &str,
     machine_code: &str,
-    events: &[(String, chrono::DateTime<chrono::Utc>)],
+    game_state: Option<&str>,
 ) -> Result<Option<HeartbeatCommand>> {
     let client = build_client()?;
     let url = format!("{}/machine/heartbeat", cs_url);
 
-    let events = events
-        .iter()
-        .map(|(code, occurred_at)| GameEvent { code, occurred_at: *occurred_at })
-        .collect();
-
     let resp = client
         .post(&url)
-        .json(&HeartbeatRequest { machine_code, ip_addresses: &local_ips(), events })
+        .json(&HeartbeatRequest { machine_code, ip_addresses: &local_ips(), game_state })
         .send()
         .await
         .with_context(|| format!("Falha ao enviar heartbeat para {}", url))?;
@@ -515,6 +523,43 @@ pub async fn send_heartbeat(
     } else {
         let code = resp.status().as_u16();
         anyhow::bail!("heartbeat HTTP {}", code)
+    }
+}
+
+/// Manda o lote completo de transições do código de 5 dígitos desde o
+/// último envio (canal separado do heartbeat, ritmo próprio — ver loop de
+/// ~2min em `main.rs`). Histórico vira `machine_event` no CS. Não devolve
+/// nada de útil pra quem chama além de sucesso/erro — esse canal não carrega
+/// comando nenhum, só o heartbeat faz isso.
+pub async fn send_game_events_batch(
+    cs_url: &str,
+    machine_code: &str,
+    events: &[(String, chrono::DateTime<chrono::Utc>)],
+) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+
+    let client = build_client()?;
+    let url = format!("{}/machine/game_events", cs_url);
+
+    let events = events
+        .iter()
+        .map(|(code, occurred_at)| GameEvent { code, occurred_at: *occurred_at })
+        .collect();
+
+    let resp = client
+        .post(&url)
+        .json(&GameEventsRequest { machine_code, events })
+        .send()
+        .await
+        .with_context(|| format!("Falha ao enviar game_events para {}", url))?;
+
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        let code = resp.status().as_u16();
+        anyhow::bail!("game_events HTTP {}", code)
     }
 }
 

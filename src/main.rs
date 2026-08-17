@@ -31,14 +31,14 @@ fn respawn_heartbeat_loop(
     machine_code: String,
     config_path: PathBuf,
     game_pid: SharedGamePid,
-    event_buffer: status_listener::SharedEventBuffer,
+    game_status: status_listener::GameStatusChannels,
 ) {
     let mut slot = handle_slot.lock().unwrap();
     if let Some(old) = slot.take() {
         old.abort();
     }
     *slot = Some(tokio::spawn(async move {
-        heartbeat_loop(&cs_url, &machine_code, &config_path, game_pid, event_buffer).await;
+        heartbeat_loop(&cs_url, &machine_code, &config_path, game_pid, game_status).await;
     }));
 }
 
@@ -57,6 +57,10 @@ mod update;
 use config::{LauncherConfig, LauncherSettings, load_config, save_config, delete_config, get_config_path, get_pairing_code_path, get_settings_path, load_settings};
 
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+/// Canal separado do heartbeat, de propósito: heartbeat é liveness + código
+/// mais recente (leve, frequente); esse aqui manda o lote completo de
+/// transições do jogo pro histórico (`machine_event`), sem pressa.
+const GAME_EVENTS_INTERVAL_SECS: u64 = 120;
 #[allow(dead_code)] // usado só no fluxo antigo (wait_for_pairing), ver comentário lá
 const PAIRING_POLL_INTERVAL_SECS: u64 = 10;
 const DEVICE_FLOW_RETRY_SECS: u64 = 10;
@@ -214,15 +218,15 @@ async fn run() -> Result<()> {
     let game_pid: SharedGamePid = Arc::new(Mutex::new(None));
     let heartbeat_handle: SharedHeartbeatHandle = Arc::new(Mutex::new(None));
 
-    let event_buffer: status_listener::SharedEventBuffer = Arc::new(Mutex::new(Vec::new()));
-    tokio::spawn(status_listener::run(event_buffer.clone(), status_listener::DEFAULT_PORT));
+    let game_status = status_listener::GameStatusChannels::new();
+    tokio::spawn(status_listener::run(game_status.clone(), status_listener::DEFAULT_PORT));
 
     loop {
         let config = load_config(&config_path).ok();
 
         match config {
             Some(cfg) => {
-                match try_get_token_and_run(&cs_url, &cfg, &fingerprint, &hw_info, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone(), event_buffer.clone()).await {
+                match try_get_token_and_run(&cs_url, &cfg, &fingerprint, &hw_info, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone(), game_status.clone()).await {
                     Ok(()) => {
                         // Sem isso, jogo que crasha na hora (SDL/lib faltando/etc)
                         // vira loop bem apertado: reinicia sem pausa nenhuma, cada
@@ -236,7 +240,7 @@ async fn run() -> Result<()> {
                     Err(e) if e.to_string().contains("401") || e.to_string().contains("403") => {
                         warn!("Credenciais inválidas ({}). Limpando config e reiniciando device flow.", e);
                         delete_config(&config_path);
-                        run_device_flow(&cs_url, &fingerprint, &hw_info, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone(), event_buffer.clone()).await?;
+                        run_device_flow(&cs_url, &fingerprint, &hw_info, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone(), game_status.clone()).await?;
                     }
                     Err(e) => {
                         error!("Erro ao obter token: {}. Tentando novamente em {}s...", e, HEARTBEAT_INTERVAL_SECS);
@@ -256,7 +260,7 @@ async fn run() -> Result<()> {
                 // (código de 4 dígitos + faixa da sala), não o pareamento OTP antigo.
                 match tui::run_menu()? {
                     Some(tui::MenuChoice::ConfigureMachine) => {
-                        run_device_flow(&cs_url, &fingerprint, &hw_info, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone(), event_buffer.clone()).await?;
+                        run_device_flow(&cs_url, &fingerprint, &hw_info, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone(), game_status.clone()).await?;
                     }
                     Some(tui::MenuChoice::TestMachine) => {
                         run_test_menu_loop().await?;
@@ -303,7 +307,7 @@ async fn try_get_token_and_run(
     settings: &LauncherSettings,
     game_pid: SharedGamePid,
     heartbeat_handle: SharedHeartbeatHandle,
-    event_buffer: status_listener::SharedEventBuffer,
+    game_status: status_listener::GameStatusChannels,
 ) -> Result<()> {
     info!("Obtendo token para máquina {}...", config.machine_code);
     let token_resp = api::get_token(cs_url, &config.machine_code, fingerprint, hw_info).await?;
@@ -315,7 +319,7 @@ async fn try_get_token_and_run(
         config.machine_code.clone(),
         config_path.clone(),
         game_pid.clone(),
-        event_buffer,
+        game_status,
     );
 
     let exit_status = spawn_game_and_wait(&token_resp.token, config, config_path, settings, game_pid).await?;
@@ -524,8 +528,8 @@ async fn wait_for_pairing(cs_url: &str, fingerprint: &str, config_path: &PathBuf
 
                         let game_pid: SharedGamePid = Arc::new(Mutex::new(None));
                         let heartbeat_handle: SharedHeartbeatHandle = Arc::new(Mutex::new(None));
-                        let event_buffer: status_listener::SharedEventBuffer = Arc::new(Mutex::new(Vec::new()));
-                        respawn_heartbeat_loop(&heartbeat_handle, cs_url.to_string(), resp.machine_code.clone(), config_path.clone(), game_pid.clone(), event_buffer);
+                        let game_status = status_listener::GameStatusChannels::new();
+                        respawn_heartbeat_loop(&heartbeat_handle, cs_url.to_string(), resp.machine_code.clone(), config_path.clone(), game_pid.clone(), game_status);
 
                         let exit_status = spawn_game_and_wait(&resp.token, &cfg, config_path, settings, game_pid).await?;
                         info!("Jogo encerrado (status: {}). Reiniciando...", exit_status);
@@ -611,7 +615,7 @@ async fn run_device_flow(
     settings: &LauncherSettings,
     game_pid: SharedGamePid,
     heartbeat_handle: SharedHeartbeatHandle,
-    event_buffer: status_listener::SharedEventBuffer,
+    game_status: status_listener::GameStatusChannels,
 ) -> Result<()> {
     let machine_type = hardware::video::detect_machine_type();
 
@@ -697,7 +701,7 @@ async fn run_device_flow(
     };
     tui::leave_screen(screen)?;
 
-    finish_device_flow(cs_url, fingerprint, config_path, settings, approved, machine_variant, game_pid, heartbeat_handle, event_buffer).await
+    finish_device_flow(cs_url, fingerprint, config_path, settings, approved, machine_variant, game_pid, heartbeat_handle, game_status).await
 }
 
 async fn finish_device_flow(
@@ -709,7 +713,7 @@ async fn finish_device_flow(
     machine_variant: String,
     game_pid: SharedGamePid,
     heartbeat_handle: SharedHeartbeatHandle,
-    event_buffer: status_listener::SharedEventBuffer,
+    game_status: status_listener::GameStatusChannels,
 ) -> Result<()> {
     let machine_code = approved
         .machine_code
@@ -731,7 +735,7 @@ async fn finish_device_flow(
     save_config(config_path, &cfg).context("Falha ao salvar configuração após aprovação")?;
     info!("Máquina ativada via device flow: {}", machine_code);
 
-    respawn_heartbeat_loop(&heartbeat_handle, cs_url.to_string(), machine_code.clone(), config_path.clone(), game_pid.clone(), event_buffer);
+    respawn_heartbeat_loop(&heartbeat_handle, cs_url.to_string(), machine_code.clone(), config_path.clone(), game_pid.clone(), game_status);
 
     let exit_status = spawn_game_and_wait(&token, &cfg, config_path, settings, game_pid).await?;
     info!("Jogo encerrado (status: {}). Reiniciando...", exit_status);
@@ -744,13 +748,36 @@ async fn heartbeat_loop(
     machine_code: &str,
     config_path: &PathBuf,
     game_pid: SharedGamePid,
-    event_buffer: status_listener::SharedEventBuffer,
+    game_status: status_listener::GameStatusChannels,
 ) {
     let mut failures = 0u32;
+
+    // Dois timers na mesma task (não uma segunda task solta) — evita
+    // repetir a classe de bug já achada em 28/07 (heartbeat_loop antigo
+    // nunca cancelado, empilhando tasks concorrentes a cada restart do
+    // jogo). `interval()` dispara imediatamente na 1ª volta por padrão;
+    // consome essa 1ª volta pra manter o comportamento de "espera antes de
+    // mandar" que o loop já tinha.
+    let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+    let mut events_tick = tokio::time::interval(Duration::from_secs(GAME_EVENTS_INTERVAL_SECS));
+    heartbeat_tick.tick().await;
+    events_tick.tick().await;
+
     loop {
-        sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
-        let events = status_listener::drain(&event_buffer);
-        match api::send_heartbeat(cs_url, machine_code, &events).await {
+        tokio::select! {
+            _ = events_tick.tick() => {
+                let events = game_status.drain();
+                if let Err(e) = api::send_game_events_batch(cs_url, machine_code, &events).await {
+                    warn!("Falha ao enviar lote de game_events ({} evento(s) perdido(s) nessa leva): {}", events.len(), e);
+                }
+                continue;
+            }
+            _ = heartbeat_tick.tick() => {}
+        }
+
+        let game_state = game_status.peek_latest();
+        let game_state = game_state.as_ref().map(|(code, _)| code.as_str());
+        match api::send_heartbeat(cs_url, machine_code, game_state).await {
             Ok(Some(cmd)) if cmd.kind == "update_launcher" => {
                 failures = 0;
                 if cmd.version == env!("CARGO_PKG_VERSION") {
