@@ -243,7 +243,12 @@ async fn run() -> Result<()> {
                         run_device_flow(&cs_url, &fingerprint, &hw_info, &config_path, &settings, game_pid.clone(), heartbeat_handle.clone(), game_status.clone()).await?;
                     }
                     Err(e) => {
-                        error!("Erro ao obter token: {}. Tentando novamente em {}s...", e, HEARTBEAT_INTERVAL_SECS);
+                        // `{:?}` (não `{}`) — no anyhow::Error o `{}` só mostra o
+                        // `.context()` de topo, escondendo a causa real (hash
+                        // mismatch, disco cheio etc.) na chain de baixo (achado
+                        // real 19/08: log só dizia "Falha ao preparar build do
+                        // jogo", sem detalhe nenhum, até investigar na unha).
+                        error!("Erro ao obter token: {:?}. Tentando novamente em {}s...", e, HEARTBEAT_INTERVAL_SECS);
                         // Erro de conexão (não 401/403, já tratado acima) —
                         // tenta consertar rede sozinho antes do próximo retry
                         // (ver network_selfheal.rs pro achado real).
@@ -519,6 +524,8 @@ async fn wait_for_pairing(cs_url: &str, fingerprint: &str, config_path: &PathBuf
                             machine_variant: "vlt".to_string(),
                             pinned_game_version: None,
                             pinned_game_sha256: None,
+                            pinned_game_layout: None,
+                            awaiting_layout_confirmation: false,
                         };
                         save_config(config_path, &cfg)
                             .context("Falha ao salvar configuração após pareamento")?;
@@ -731,6 +738,8 @@ async fn finish_device_flow(
         // (ver `spawn_game_and_wait`).
         pinned_game_version: None,
         pinned_game_sha256: None,
+        pinned_game_layout: None,
+        awaiting_layout_confirmation: false,
     };
     save_config(config_path, &cfg).context("Falha ao salvar configuração após aprovação")?;
     info!("Máquina ativada via device flow: {}", machine_code);
@@ -819,6 +828,12 @@ async fn heartbeat_loop(
                     Ok(mut fresh) => {
                         fresh.pinned_game_version = Some(cmd.version.clone());
                         fresh.pinned_game_sha256 = Some(cmd.sha256.clone());
+                        // Update explícito veio de humano pelo backoffice — é o
+                        // sinal de "sim, essa mudança de tela foi intencional".
+                        // Próxima vez que o jogo for preparado, o layout ao
+                        // vivo vira o novo `pinned_game_layout` mesmo que
+                        // divergente do anterior, sem bloquear/avisar.
+                        fresh.awaiting_layout_confirmation = true;
                         if let Err(e) = save_config(config_path, &fresh) {
                             error!("Falha ao salvar pin de versão do jogo: {}", e);
                         }
@@ -939,14 +954,24 @@ fn configure_display_layout() {
             cmd.args(["--output", only, "--mode", mode_used, "--rotate", "left", "--primary"]);
         }
         [first, second, ..] => {
+            // `--rotate normal` explícito nos dois: sem isso, uma saída que
+            // rodou antes em modo single (`--rotate left`) fica travada
+            // nessa rotação e o xrandr recusa o mode set do dual inteiro
+            // (achado real 19/08: máquina foi de single pra dual sem
+            // reiniciar, `xrandr` saiu com status 1 até o reboot limpar o X).
             mode_used = GAME_SCREEN_MODE;
-            cmd.args(["--output", first, "--mode", mode_used, "--primary"]);
-            cmd.args(["--output", second, "--mode", mode_used, "--below", first]);
+            cmd.args(["--output", first, "--mode", mode_used, "--rotate", "normal", "--primary"]);
+            cmd.args(["--output", second, "--mode", mode_used, "--rotate", "normal", "--below", first]);
         }
     }
-    match cmd.status() {
-        Ok(s) if s.success() => info!("Layout de tela configurado ({:?}): {:?}", mode_used, names),
-        Ok(s) => warn!("xrandr saiu com status {} configurando {:?}", s, names),
+    match cmd.output() {
+        Ok(o) if o.status.success() => info!("Layout de tela configurado ({:?}): {:?}", mode_used, names),
+        Ok(o) => warn!(
+            "xrandr saiu com status {} configurando {:?}: {}",
+            o.status,
+            names,
+            String::from_utf8_lossy(&o.stderr).trim()
+        ),
         Err(e) => warn!("Falha ao rodar xrandr: {}", e),
     }
 }
@@ -977,6 +1002,68 @@ async fn spawn_game_and_wait(
     // sendo baixada por causa disso).
     ensure_x_running();
     let layout = hardware::video::detect_machine_type();
+
+    if cfg.awaiting_layout_confirmation {
+        // Um `update_game` explícito chegou pelo backoffice desde a última
+        // vez — humano confirmou a intenção de mudança, então o que tiver
+        // conectado agora vira o novo baseline, mesmo que divergente do pin
+        // anterior (ex: operador corrigiu instalação de 1 pra 2 telas e já
+        // subiu a build dual). Consome a janela (volta a `false`) pra não
+        // aceitar mudanças espontâneas depois.
+        if let Ok(mut fresh) = load_config(config_path) {
+            fresh.pinned_game_layout = Some(layout.to_string());
+            fresh.awaiting_layout_confirmation = false;
+            if let Err(e) = save_config(config_path, &fresh) {
+                warn!("Falha ao confirmar novo layout pinado: {}", e);
+            } else {
+                info!("Layout {:?} confirmado como novo baseline (update de jogo explícito).", layout);
+            }
+        }
+    } else if let Some(pinned_layout) = cfg.pinned_game_layout.as_deref() {
+        // Máquina já tem um layout de baseline (pin) e o que tá conectado
+        // agora é outro, sem confirmação explícita — não adianta baixar
+        // build nenhuma, vai dar hash mismatch lá na frente (achado real
+        // 19/08: máquina pinada em dual_screen com só 1 monitor conectado,
+        // ficava tentando pra sempre com erro genérico). Avisa na tela e
+        // deixa o loop de retry de 30s (no chamador) reobservar sozinho —
+        // assim que o monitor certo aparecer, essa checagem passa a bater.
+        // Também bloqueia o sentido contrário (monitor a mais aparecendo
+        // sozinho, sem update pedido) de propósito: só muda com confirmação.
+        if pinned_layout != layout {
+            tui::draw_lines(
+                &mut screen,
+                "Preparando Jogo",
+                &[
+                    format!("Máquina configurada para {}.", pinned_layout),
+                    format!("Detectei {} agora.", layout),
+                    "Confere o(s) monitor(es) conectado(s).".to_string(),
+                ],
+            )?;
+            std::thread::sleep(Duration::from_secs(5));
+            tui::leave_screen(screen)?;
+            anyhow::bail!(
+                "layout de tela não confere: esperado {} (pin), detectado {} — confira os monitores conectados",
+                pinned_layout,
+                layout
+            );
+        }
+    } else if cfg.pinned_game_version.is_some() {
+        // Máquina já pareada/pinada antes desse campo existir — sem
+        // baseline de layout pra comparar. Backfill: já tá rodando de
+        // verdade com esse layout agora, então assume que é o correto
+        // (só roda esse ramo 1x por máquina, próximo boot já cai no `if`
+        // acima). Sem isso, a checagem de mismatch nunca ativaria pra
+        // frota já em produção, só pra máquina pareada depois desse fix.
+        if let Ok(mut fresh) = load_config(config_path) {
+            fresh.pinned_game_layout = Some(layout.to_string());
+            if let Err(e) = save_config(config_path, &fresh) {
+                warn!("Falha ao gravar backfill de layout pinado: {}", e);
+            } else {
+                info!("Layout {:?} gravado como baseline (backfill de máquina já pareada)", layout);
+            }
+        }
+    }
+
     let game_args: Vec<String> = if layout == "single_screen_vertical" {
         SINGLE_SCREEN_GAME_ARGS.iter().map(|s| s.to_string()).collect()
     } else {
@@ -1049,6 +1136,7 @@ async fn spawn_game_and_wait(
         if let Ok(mut fresh) = load_config(config_path) {
             fresh.pinned_game_version = Some(resolved_version.clone());
             fresh.pinned_game_sha256 = Some(resolved_sha256.clone());
+            fresh.pinned_game_layout = Some(layout.to_string());
             if let Err(e) = save_config(config_path, &fresh) {
                 warn!("Falha ao gravar pin local de versão do jogo: {}", e);
             }

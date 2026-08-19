@@ -1,6 +1,6 @@
 [package]
 name = "pachinko_vlt_launcher"
-version = "0.2.14"
+version = "0.2.17"
 edition = "2021"
 authors = ["Pachinko Team"]
 description = "Launcher VLT para registro e autenticação de máquinas"

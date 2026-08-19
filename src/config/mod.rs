@@ -44,6 +44,26 @@ pub struct LauncherConfig {
     pub pinned_game_version: Option<String>,
     #[serde(default)]
     pub pinned_game_sha256: Option<String>,
+    /// Layout (`dual_screen`/`single_screen_vertical`) detectado no momento
+    /// do baseline do pin acima. `None` = config salvo antes desse campo
+    /// existir, ou sem pin ainda — nesse caso não dá pra comparar, segue o
+    /// que `detect_machine_type()` disser na hora sem avisar nada. Fica
+    /// "travado" nesse valor até um `update_game` explícito do backend (ver
+    /// `awaiting_layout_confirmation`) — CS não conhece layout de propósito
+    /// (arquitetura: só o launcher detecta hardware), então não dá pra ele
+    /// mandar o valor certo direto.
+    #[serde(default)]
+    pub pinned_game_layout: Option<String>,
+    /// `true` só entre o momento em que um comando `update_game` chega pelo
+    /// heartbeat e a próxima vez que o jogo tenta subir de verdade. Marca
+    /// que um humano pediu essa atualização deliberadamente pelo backoffice
+    /// — nessa janela, o layout detectado ao vivo vira o novo
+    /// `pinned_game_layout` mesmo se divergir do anterior (achado 19/08:
+    /// monitor a mais/a menos aparecer sozinho nunca deve mudar o pin
+    /// silenciosamente, só quando alguém confirma a mudança pedindo update).
+    /// Consumida (volta a `false`) assim que usada uma vez.
+    #[serde(default)]
+    pub awaiting_layout_confirmation: bool,
 }
 
 pub fn get_config_path() -> Result<PathBuf> {
