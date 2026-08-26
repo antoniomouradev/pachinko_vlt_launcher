@@ -18,7 +18,7 @@ pub fn default_cs_url() -> &'static str {
 pub fn default_game_registry_url() -> &'static str {
     match option_env!("LAUNCHER_ENV") {
         Some("street") => "https://p3-sp-teste.espindola.software:8090",
-        Some("pb") => "https://p3-pb-prod.espindola.software:8090",
+        Some("pb") => "https://p3-pb-prod.espindola.software/registry",
         _ => "https://pachinko.espindolasoftware.com.br:8090",
     }
 }
