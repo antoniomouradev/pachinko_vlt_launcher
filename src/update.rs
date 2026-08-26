@@ -77,7 +77,10 @@ pub async fn apply_update(version: &str, url: &str, sha256: &str) -> Result<()> 
 /// poucos MB — sem necessidade do streaming incremental que o download do
 /// jogo usa), confere hash do pacote, descompacta em `release_dir`.
 async fn download_and_extract(url: &str, expected_sha256: &str, release_dir: &Path) -> Result<()> {
-    let resp = reqwest::get(url).await.context("Falha ao baixar update")?;
+    let client = reqwest::Client::builder()
+        .build()
+        .context("Falha ao criar cliente HTTP")?;
+    let resp = client.get(url).send().await.context("Falha ao baixar update")?;
     if !resp.status().is_success() {
         anyhow::bail!("download do update HTTP {}", resp.status());
     }
@@ -169,7 +172,13 @@ fn revert_symlink() {
 }
 
 async fn report_update(cs_url: &str, machine_code: &str, version: &str, status: &str) {
-    let client = reqwest::Client::new();
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Falha ao criar cliente HTTP pra reportar update: {}", e);
+            return;
+        }
+    };
     let url = format!("{}/machine/launcher_update_report", cs_url);
     let body = serde_json::json!({
         "machine_code": machine_code,

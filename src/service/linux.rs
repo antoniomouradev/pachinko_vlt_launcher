@@ -29,8 +29,8 @@ StandardError=journal
 TTYPath=/dev/tty1
 TTYReset=yes
 TTYVTDisallocate=no
-Environment="CS_URL=https://pachinko.espindolasoftware.com.br"
-Environment="GAME_REGISTRY_URL=https://pachinko.espindolasoftware.com.br:8090"
+Environment="CS_URL={}"
+Environment="GAME_REGISTRY_URL={}"
 Environment="DISPLAY=:0.0"
 Environment="XAUTHORITY=/root/.Xauthority"
 Environment="RUST_LOG=info"
@@ -38,7 +38,9 @@ Environment="RUST_LOG=info"
 [Install]
 WantedBy=multi-user.target
 "#,
-        BINARY_NAME
+        BINARY_NAME,
+        crate::env_config::default_cs_url(),
+        crate::env_config::default_game_registry_url(),
     );
 
     fs::write(SERVICE_FILE, service_content)

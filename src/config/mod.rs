@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 fn default_game_registry_url() -> String {
-    "https://pachinko.espindolasoftware.com.br:8090".to_string()
+    crate::env_config::default_game_registry_url().to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

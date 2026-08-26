@@ -47,6 +47,7 @@ mod api;
 mod config;
 mod game_runtime;
 mod service;
+mod env_config;
 mod error;
 mod network_selfheal;
 mod setup;
@@ -174,7 +175,7 @@ fn load_runtime_settings() -> LauncherSettings {
         }
     }
     LauncherSettings {
-        cs_url: std::env::var("CS_URL").unwrap_or_else(|_| "https://pachinko.espindolasoftware.com.br".to_string()),
+        cs_url: std::env::var("CS_URL").unwrap_or_else(|_| env_config::default_cs_url().to_string()),
         game_path: std::env::var("VLT_GAME_PATH").unwrap_or_else(|_| "./pachinko_game".to_string()),
         // Mesmo comando já usado em produção noutra máquina (ver .xinitrc de
         // referência) — só o `--token` virou `GAME_TOKEN` via env.
@@ -186,7 +187,7 @@ fn load_runtime_settings() -> LauncherSettings {
             .map(String::from)
             .collect(),
         game_registry_url: std::env::var("GAME_REGISTRY_URL")
-            .unwrap_or_else(|_| "https://pachinko.espindolasoftware.com.br:8090".to_string()),
+            .unwrap_or_else(|_| env_config::default_game_registry_url().to_string()),
     }
 }
 
@@ -327,7 +328,9 @@ async fn try_get_token_and_run(
         game_status,
     );
 
-    let exit_status = spawn_game_and_wait(&token_resp.token, config, config_path, settings, game_pid).await?;
+    let rgs_url = build_rgs_url(&token_resp.rgs_url, &token_resp.rgs_port);
+    let exit_status =
+        spawn_game_and_wait(&token_resp.token, rgs_url.as_deref(), config, config_path, settings, game_pid).await?;
     info!("Jogo encerrado (status: {}). Reiniciando...", exit_status);
 
     Ok(())
@@ -538,7 +541,9 @@ async fn wait_for_pairing(cs_url: &str, fingerprint: &str, config_path: &PathBuf
                         let game_status = status_listener::GameStatusChannels::new();
                         respawn_heartbeat_loop(&heartbeat_handle, cs_url.to_string(), resp.machine_code.clone(), config_path.clone(), game_pid.clone(), game_status);
 
-                        let exit_status = spawn_game_and_wait(&resp.token, &cfg, config_path, settings, game_pid).await?;
+                        let rgs_url = build_rgs_url(&resp.rgs_url, &resp.rgs_port);
+                        let exit_status =
+                            spawn_game_and_wait(&resp.token, rgs_url.as_deref(), &cfg, config_path, settings, game_pid).await?;
                         info!("Jogo encerrado (status: {}). Reiniciando...", exit_status);
                         return Ok(());
                     }
@@ -746,7 +751,11 @@ async fn finish_device_flow(
 
     respawn_heartbeat_loop(&heartbeat_handle, cs_url.to_string(), machine_code.clone(), config_path.clone(), game_pid.clone(), game_status);
 
-    let exit_status = spawn_game_and_wait(&token, &cfg, config_path, settings, game_pid).await?;
+    let rgs_url = approved
+        .rgs_url
+        .as_deref()
+        .and_then(|url| build_rgs_url(url, approved.rgs_port.as_ref().unwrap_or(&serde_json::Value::Null)));
+    let exit_status = spawn_game_and_wait(&token, rgs_url.as_deref(), &cfg, config_path, settings, game_pid).await?;
     info!("Jogo encerrado (status: {}). Reiniciando...", exit_status);
 
     Ok(())
@@ -789,18 +798,20 @@ async fn heartbeat_loop(
         match api::send_heartbeat(cs_url, machine_code, game_state).await {
             Ok(Some(cmd)) if cmd.kind == "update_launcher" => {
                 failures = 0;
-                if cmd.version == env!("CARGO_PKG_VERSION") {
-                    // Já é a versão atual — pendência deveria ter sido limpa
-                    // pelo self-check no boot; loga só pra flagar se não foi.
-                    warn!("Update pendente já é a versão atual ({}), ignorando.", cmd.version);
-                } else {
-                    info!(
-                        "Update de launcher solicitado pelo backend: versão {} ({})",
-                        cmd.version, cmd.url
-                    );
-                    if let Err(e) = update::apply_update(&cmd.version, &cmd.url, &cmd.sha256).await {
-                        error!("Falha ao aplicar update de launcher: {}", e);
-                    }
+                // Não pula mais só por bater o número da versão — apply_update
+                // já decide por hash (`already_ready`), então republicar a
+                // mesma versão com conteúdo diferente (esqueceu algo, subiu de
+                // novo com o mesmo número) é pego certo. Chamar sempre também
+                // garante que o ciclo completo (restart + self-check no boot)
+                // sempre reporta de volta pra CS — sem isso, `pending_launcher_
+                // version` ficava preso pra sempre quando a versão já batia,
+                // travando qualquer outro comando atrás dele (achado real 24/08).
+                info!(
+                    "Update de launcher solicitado pelo backend: versão {} ({})",
+                    cmd.version, cmd.url
+                );
+                if let Err(e) = update::apply_update(&cmd.version, &cmd.url, &cmd.sha256).await {
+                    error!("Falha ao aplicar update de launcher: {}", e);
                 }
             }
             Ok(Some(cmd)) if cmd.kind == "reboot" => {
@@ -985,8 +996,30 @@ fn configure_display_layout() {
 const SINGLE_SCREEN_GAME_ARGS: &[&str] =
     &["--channel", "web", "--layout=stacked_dual", "--top-header-font", "--top-header-above-video"];
 
+// Combina rgs_url (schema+host, ex: "https://191.9.124.164") + rgs_port
+// (separado, número ou string) que a CS devolveu no /launcher — mesmo
+// servidor que autenticou o token é quem o jogo deve usar via `--rgs-url`.
+// Sem isso, cada troca de backend (ex: Contabo -> stage-gang) exigiria
+// rebuildar o jogo, já que a URL ficava só fixa em `GameControl.hx`.
+fn build_rgs_url(rgs_url: &str, rgs_port: &serde_json::Value) -> Option<String> {
+    if rgs_url.is_empty() {
+        return None;
+    }
+    let base = rgs_url.trim_end_matches('/');
+    let port_str = match rgs_port {
+        serde_json::Value::String(s) if !s.is_empty() => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    };
+    match port_str {
+        Some(port) => Some(format!("{}:{}", base, port)),
+        None => Some(base.to_string()),
+    }
+}
+
 async fn spawn_game_and_wait(
     token: &str,
+    rgs_url: Option<&str>,
     cfg: &LauncherConfig,
     config_path: &PathBuf,
     settings: &LauncherSettings,
@@ -1204,13 +1237,25 @@ async fn spawn_game_and_wait(
     // no ambiente fica de bônus (sem uso ainda, caso o jogo ganhe suporte
     // depois), mas `--token` no argv é o que faz o jogo autenticar de
     // verdade — sem isso ele roda sem token nenhum, sem dar erro visível.
-    let mut child = Command::new(&bin_path)
-        .current_dir(&game_dir)
+    let mut cmd = Command::new(&bin_path);
+    cmd.current_dir(&game_dir)
         .env("GAME_TOKEN", token)
         .env("DISPLAY", display)
         .env("XAUTHORITY", xauthority)
         .arg("--token")
-        .arg(token)
+        .arg(token);
+    // `--rgs-url` repassa o mesmo servidor que a CS usou pra autenticar o
+    // token (RuntimeConfig.hx::applyRgsUrl) — permite trocar de backend
+    // (Contabo <-> stage-gang etc) sem rebuild do jogo, o build baixado do
+    // registry já serve pra qualquer ambiente.
+    if let Some(url) = rgs_url {
+        cmd.arg("--rgs-url").arg(url);
+    }
+    // `--machineId` (RuntimeConfig.hx::applyMachineId) — sem isso o jogo
+    // cai no hardcoded `vltMachineId = "5"` (GameControl.hx). Achado 25/08:
+    // nunca foi passado pelo launcher.
+    cmd.arg("--machineId").arg(&cfg.machine_code);
+    let mut child = cmd
         .args(&game_args)
         .stdout(game_log)
         .stderr(game_log_stderr)
