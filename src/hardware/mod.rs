@@ -5,6 +5,7 @@ mod macos;
 pub mod audio;
 pub mod video;
 pub mod buttonhub;
+pub mod touch;
 
 use serde::Serialize;
 use sha2::{Sha256, Digest};

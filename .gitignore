@@ -17,6 +17,7 @@ dist/
 *.dll
 *.so
 *.dylib
+*.tar.gz
 
 # Config (pode conter dados sensíveis)
 launcher_config.json
