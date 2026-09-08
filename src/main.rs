@@ -191,16 +191,11 @@ fn load_runtime_settings() -> LauncherSettings {
     }
 }
 
-/// Fixo por enquanto (ver BACKLOG.md "Controle de volume via launcher") —
-/// sem configuração remota ainda, só garante volume consistente entre
-/// máquinas na hora.
-const DEFAULT_VOLUME_PERCENT: u8 = 70;
-
 async fn run() -> Result<()> {
     let settings = load_runtime_settings();
     let cs_url = settings.cs_url.clone();
 
-    hardware::audio::set_volume(DEFAULT_VOLUME_PERCENT);
+    hardware::audio::set_volume(env_config::default_volume_percent());
     hardware::touch::ensure_touch_calibration();
 
     let hw_info = hardware::collect()

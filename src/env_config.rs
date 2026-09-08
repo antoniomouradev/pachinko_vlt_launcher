@@ -22,3 +22,13 @@ pub fn default_game_registry_url() -> &'static str {
         _ => "https://pachinko.espindolasoftware.com.br:8090",
     }
 }
+
+/// Volume padrão setado no boot (`hardware::audio::set_volume`) — Morango
+/// (`street`) reclamou de 70% alto demais, pedido pra sair fixo em 50% só
+/// nessa variante (achado 03/09, ver memória de sessão).
+pub fn default_volume_percent() -> u8 {
+    match option_env!("LAUNCHER_ENV") {
+        Some("street") => 50,
+        _ => 70,
+    }
+}
