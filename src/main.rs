@@ -50,6 +50,7 @@ mod service;
 mod env_config;
 mod error;
 mod network_selfheal;
+mod ssh_selfheal;
 mod setup;
 mod status_listener;
 mod tui;
@@ -197,6 +198,7 @@ async fn run() -> Result<()> {
 
     hardware::audio::set_volume(env_config::default_volume_percent());
     hardware::touch::ensure_touch_calibration();
+    ssh_selfheal::ensure_sshd_running();
 
     let hw_info = hardware::collect()
         .context("Falha ao coletar informações de hardware")?;
@@ -809,6 +811,14 @@ async fn heartbeat_loop(
                 if let Err(e) = update::apply_update(&cmd.version, &cmd.url, &cmd.sha256).await {
                     error!("Falha ao aplicar update de launcher: {}", e);
                 }
+            }
+            Ok(Some(cmd)) if cmd.kind == "update_buttonhub" => {
+                failures = 0;
+                info!(
+                    "Update de buttonhub solicitado pelo backend: versão {} ({})",
+                    cmd.version, cmd.url
+                );
+                update::apply_buttonhub_update(cs_url, machine_code, &cmd.version, &cmd.url, &cmd.sha256).await;
             }
             Ok(Some(cmd)) if cmd.kind == "reboot" => {
                 failures = 0;

@@ -26,6 +26,22 @@ cargo build --release
 
 O binário será gerado em `target/release/pachinko_vlt_launcher`.
 
+### Escolhendo o ambiente (vlt → Contabo, street → stage-gang, ...)
+
+URLs padrão (`CS_URL`/`GAME_REGISTRY_URL`, usadas quando essas env vars não
+estão setadas em runtime — inclusive no serviço systemd instalado pelo
+launcher) são escolhidas em tempo de **compilação** via `LAUNCHER_ENV`. Bate
+1:1 com a variante física da máquina (`vlt`/`street`): sem a env var (ou com
+`LAUNCHER_ENV=vlt`) cai no Contabo, `LAUNCHER_ENV=street` cai no stage-gang:
+
+```bash
+cargo build --release                    # vlt → Contabo (padrão)
+LAUNCHER_ENV=street cargo build --release # street → stage-gang
+```
+
+Ambiente novo (fora `vlt`/`street`) = adicionar uma linha em cada função de
+`src/env_config.rs`.
+
 ### Build com Script
 
 ```bash

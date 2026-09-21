@@ -468,8 +468,14 @@ pub async fn download_bytes_with_progress(
 ) -> Result<Vec<u8>> {
     use futures_util::StreamExt;
 
+    // Sem `.timeout()` de propósito -- era um timeout de REQUISIÇÃO INTEIRA
+    // (300s), não por chunk parado; num link ruim/instável isso descartava
+    // um download que já tinha progredido bastante (achado 11/09: máquina
+    // do Diamond perdia 40%+ de progresso e reiniciava do zero, sempre).
+    // Seguro tirar de vez porque agora tem uma rede de segurança fora do
+    // launcher (script na jumpbox, via LAN, roda em cron) pra máquina que
+    // ficar travada de verdade -- não depende só dessa tentativa.
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
         .build()
         .context("Falha ao criar cliente HTTP")?;
 

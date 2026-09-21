@@ -171,6 +171,147 @@ fn revert_symlink() {
     }
 }
 
+const BUTTONHUB_BIN_PATH: &str = "/usr/local/bin/buttonhub";
+const BUTTONHUB_PREVIOUS_PATH: &str = "/usr/local/bin/buttonhub.previous";
+const BUTTONHUB_SERVICE_NAME: &str = "buttonhub";
+/// Tempo que o `duran_ptnk_init()` leva de verdade (3x sleep(1) — flush,
+/// reset de lâmpada, liga noteiro) antes do servidor começar a escutar.
+/// Sem essa espera o self-check conecta cedo demais e vê falha falsa.
+const BUTTONHUB_STARTUP_WAIT_MS: u64 = 4000;
+
+/// Baixa o binário novo do `buttonhub` (arquivo solto, sem tar.gz — troca
+/// direto em `/usr/local/bin/buttonhub`), confere hash, para o serviço,
+/// troca o binário, reinicia e confere se voltou a responder. Sem
+/// self-check-no-próximo-boot como o launcher: como é um serviço
+/// separado, dá pra confirmar tudo na mesma chamada, sem matar este
+/// processo (o launcher continua rodando normalmente durante a troca).
+pub async fn apply_buttonhub_update(cs_url: &str, machine_code: &str, version: &str, url: &str, sha256: &str) {
+    let bytes = match download_buttonhub_binary(url, sha256).await {
+        Ok(b) => b,
+        Err(e) => {
+            log::error!("Falha ao baixar/validar update de buttonhub {}: {}", version, e);
+            return; // nada foi trocado, sem rollback necessário
+        }
+    };
+
+    // Precisa parar o serviço ANTES de escrever — o binário atual fica com
+    // o executável aberto (fd em uso pelo processo rodando), sobrescrever
+    // em cima dá "Text file busy" (ETXTBSY), confirmado na prática.
+    let _ = tokio::process::Command::new("systemctl")
+        .args(["stop", BUTTONHUB_SERVICE_NAME])
+        .status()
+        .await;
+
+    // Guarda o binário atual pra rollback ANTES de sobrescrever.
+    let backup_ok = std::fs::copy(BUTTONHUB_BIN_PATH, BUTTONHUB_PREVIOUS_PATH).is_ok();
+    if !backup_ok {
+        log::warn!("Não consegui salvar backup do buttonhub atual — rollback ficará indisponível se o update falhar.");
+    }
+
+    if let Err(e) = write_buttonhub_binary(&bytes) {
+        log::error!("Falha ao escrever binário novo do buttonhub: {}", e);
+        let _ = tokio::process::Command::new("systemctl")
+            .args(["start", BUTTONHUB_SERVICE_NAME])
+            .status()
+            .await;
+        report_buttonhub_update(cs_url, machine_code, version, "rollback_systemd").await;
+        return;
+    }
+
+    log::info!("Buttonhub {} instalado, iniciando serviço...", version);
+    let _ = tokio::process::Command::new("systemctl")
+        .args(["start", BUTTONHUB_SERVICE_NAME])
+        .status()
+        .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(BUTTONHUB_STARTUP_WAIT_MS)).await;
+
+    if buttonhub_self_check() {
+        log::info!("Self-check do buttonhub {} OK.", version);
+        report_buttonhub_update(cs_url, machine_code, version, "success").await;
+        return;
+    }
+
+    log::warn!("Self-check do buttonhub {} FALHOU — revertendo.", version);
+    if backup_ok {
+        let _ = std::fs::copy(BUTTONHUB_PREVIOUS_PATH, BUTTONHUB_BIN_PATH);
+        let _ = tokio::process::Command::new("systemctl")
+            .args(["restart", BUTTONHUB_SERVICE_NAME])
+            .status()
+            .await;
+    }
+    report_buttonhub_update(cs_url, machine_code, version, "rollback_systemd").await;
+}
+
+/// Baixa o binário (arquivo único, sem descompactar), confere SHA-256 do
+/// conteúdo baixado antes de devolver.
+async fn download_buttonhub_binary(url: &str, expected_sha256: &str) -> Result<Vec<u8>> {
+    let client = reqwest::Client::builder()
+        .build()
+        .context("Falha ao criar cliente HTTP")?;
+    let resp = client.get(url).send().await.context("Falha ao baixar update do buttonhub")?;
+    if !resp.status().is_success() {
+        anyhow::bail!("download do update de buttonhub HTTP {}", resp.status());
+    }
+    let bytes = resp.bytes().await.context("Falha ao ler bytes do update de buttonhub")?.to_vec();
+
+    let actual_sha256 = {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(&bytes))
+    };
+    if actual_sha256 != expected_sha256 {
+        anyhow::bail!(
+            "SHA-256 do buttonhub não confere (esperado {}, obtido {}) — update descartado",
+            expected_sha256, actual_sha256
+        );
+    }
+    Ok(bytes)
+}
+
+fn write_buttonhub_binary(bytes: &[u8]) -> Result<()> {
+    std::fs::write(BUTTONHUB_BIN_PATH, bytes).context("Falha ao gravar binário do buttonhub")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(BUTTONHUB_BIN_PATH)?.permissions();
+        perms.set_mode(perms.mode() | 0o755);
+        std::fs::set_permissions(BUTTONHUB_BIN_PATH, perms)?;
+    }
+    Ok(())
+}
+
+/// Mesma checagem que `self_check()` (update do próprio launcher) já faz
+/// pro buttonhub — só confirma que o processo novo respondeu ao handshake
+/// TCP, não valida hardware físico nenhum.
+fn buttonhub_self_check() -> bool {
+    match crate::hardware::buttonhub::connect(crate::hardware::buttonhub::DEFAULT_PORT) {
+        Ok(conn) => {
+            conn.close();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+async fn report_buttonhub_update(cs_url: &str, machine_code: &str, version: &str, status: &str) {
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!("Falha ao criar cliente HTTP pra reportar update de buttonhub: {}", e);
+            return;
+        }
+    };
+    let url = format!("{}/machine/buttonhub_update_report", cs_url);
+    let body = serde_json::json!({
+        "machine_code": machine_code,
+        "buttonhub_version": version,
+        "status": status,
+    });
+    if let Err(e) = client.post(&url).json(&body).send().await {
+        log::warn!("Falha ao reportar resultado do update de buttonhub pro backend: {}", e);
+    }
+}
+
 async fn report_update(cs_url: &str, machine_code: &str, version: &str, status: &str) {
     let client = match reqwest::Client::builder().build() {
         Ok(c) => c,
